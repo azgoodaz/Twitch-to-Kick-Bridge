@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Twitch → Kick Bridge</title>
+  <style>
+    body { width: 380px; margin: 0; font: 13px/1.4 system-ui, sans-serif; color: #1f1f23; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid #e4e4e7; }
+    header strong { font-size: 14px; }
+    header a { color: #5c5c66; cursor: pointer; margin-left: 10px; font-size: 12px; text-decoration: underline; }
+    #connect, #message { padding: 16px 12px; }
+    button { padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; border: 0; border-radius: 6px; background: #9146ff; color: #fff; }
+    #bar { padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; align-items: center; color: #5c5c66; font-size: 12px; }
+    .opts { display: flex; gap: 12px; align-items: center; }
+    #refresh { padding: 1px 8px; background: #efeff1; color: #1f1f23; font-size: 14px; }
+    #rows { list-style: none; margin: 0; padding: 0; max-height: 460px; overflow-y: auto; }
+    .row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-top: 1px solid #f0f0f2; }
+    .row img { border-radius: 50%; flex: none; }
+    .mid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    .mid .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mid .sub { color: #5c5c66; font-size: 12px; }
+    .row.live .sub { color: #c0211f; }
+    .go { flex: none; padding: 5px 10px; border-radius: 6px; background: #53fc18; color: #0b0e0f; font-weight: 600; text-decoration: none; }
+    .row.nokick { display: none; }
+    #rows.liveOnly .row:not(.live) { display: none !important; }
+    #rows.showAll .row.nokick { display: flex; opacity: .55; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Followed → Kick</strong>
+    <span><a id="settings">Settings</a><a id="disconnect" hidden>Disconnect</a></span>
+  </header>
+
+  <div id="message" hidden></div>
+
+  <div id="connect" hidden>
+    <p id="connectMsg">Connect your Twitch account to see which streamers you follow are also on Kick.
+      Only the “read your follows” permission is requested.</p>
+    <button id="connectBtn">Connect Twitch</button>
+  </div>
+
+  <div id="list" hidden>
+    <div id="bar">
+      <span id="status">Loading…</span>
+      <span class="opts"><button id="refresh" title="Refresh live status (Shift+click: recheck everyone)">↻</button><label><input type="checkbox" id="liveOnly"> live only</label><label><input type="checkbox" id="showAll"> show not on Kick</label></span>
+    </div>
+    <ul id="rows"></ul>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

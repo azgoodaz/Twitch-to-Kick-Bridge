@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch → Kick Bridge",
+  "version": "0.1.0",
+  "description": "Shows a Kick profile button on Twitch channels when the streamer is also on Kick.",
+  "permissions": [
+    "storage",
+    "identity"
+  ],
+  "host_permissions": [
+    "https://www.twitch.tv/*",
+    "https://id.twitch.tv/*",
+    "https://api.twitch.tv/*",
+    "https://id.kick.com/*",
+    "https://api.kick.com/*",
+    "https://kick.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.twitch.tv/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "Twitch → Kick Bridge",
+    "default_popup": "popup.html"
+  }
+}

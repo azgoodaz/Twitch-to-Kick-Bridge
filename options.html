@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Twitch → Kick Bridge</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; max-width: 560px; margin: 32px auto; padding: 0 16px; color: #1f1f23; }
+    h1 { font-size: 20px; }
+    h2 { font-size: 15px; margin-top: 24px; }
+    label { display: block; margin: 10px 0 4px; font-weight: 600; }
+    input { width: 100%; padding: 8px; box-sizing: border-box; font: inherit; }
+    button { margin-top: 14px; padding: 8px 14px; font: inherit; cursor: pointer; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row input { flex: 1; }
+    .row button { margin-top: 0; }
+    pre { background: #f4f4f5; padding: 10px; overflow: auto; border-radius: 6px; }
+    small { color: #5c5c66; }
+  </style>
+</head>
+<body>
+  <h1>Twitch → Kick Bridge</h1>
+  <small>Credentials are stored locally in this browser profile (dev/testing use).</small>
+
+  <h2>Display</h2>
+  <label style="font-weight:400"><input id="minimal" type="checkbox" style="width:auto">
+    Minimal button on Twitch pages (live dot + “Kick” only)</label>
+  <small>Applies instantly. Hover the button for details.</small>
+
+  <h2>Kick (required)</h2>
+  <small>Create an app at kick.com/settings/developer</small>
+  <label for="kickId">Client ID</label>
+  <input id="kickId" autocomplete="off">
+  <label for="kickSecret">Client Secret</label>
+  <input id="kickSecret" type="password" autocomplete="off">
+
+  <h2>Twitch</h2>
+  <small>Create an app at dev.twitch.tv/console. The Client ID is needed for the followed-streamers popup; the secret is only used for the bio cross-check on channel pages.</small>
+  <p><small>Add this exact URL under your Twitch app's <b>OAuth Redirect URLs</b>:<br><code id="redirect"></code></small></p>
+  <label for="twitchId">Client ID</label>
+  <input id="twitchId" autocomplete="off">
+  <label for="twitchSecret">Client Secret</label>
+  <input id="twitchSecret" type="password" autocomplete="off">
+
+  <button id="save">Save</button> <span id="saved"></span>
+
+  <h2>Test a lookup</h2>
+  <div class="row">
+    <input id="testLogin" placeholder="Twitch username, e.g. xqc">
+    <button id="test">Test</button>
+  </div>
+  <pre id="out">—</pre>
+
+  <script src="options.js"></script>
+</body>
+</html>
