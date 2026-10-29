@@ -2,8 +2,6 @@ const $ = (id) => document.getElementById(id);
 
 // How long cached data is trusted before it is quietly refreshed in the background.
 const FOLLOWS_TTL = 60 * 60 * 1000;          // your follow list: 1 hour
-const LIVE_TTL = 60 * 1000;                  // live status of channels on Kick (cheap, batched): 1 minute
-const FAIL_TTL = 30 * 60 * 1000;             // retry a failed check after 30 minutes
 const MISS_TTL = 7 * 24 * 60 * 60 * 1000;    // "not on Kick": 1 week
 
 let runId = 0;          // bumps on every render so older background checks stop themselves
@@ -69,10 +67,11 @@ $("liveOnly").addEventListener("change", (e) => {
 });
 chrome.storage.local.get("liveOnly").then((s) => applyLiveOnly(Boolean(s.liveOnly)));
 
-// ↻ refreshes live status of channels known to be on Kick.
-// Shift+↻ also re-checks every follow (e.g. someone just joined Kick).
+// ↻ is the ONLY thing that re-checks streamers after the first load:
+//   click       = refresh live status + check anything unchecked/failed
+//   Shift+click = re-check every follow from scratch (e.g. someone just joined Kick)
 $("refresh").addEventListener("click", (e) => {
-  if (currentList.length) renderFromCache(currentList, e.shiftKey ? "all" : "live");
+  if (currentList.length) renderFromCache(currentList, e.shiftKey ? "all" : "manual");
 });
 
 // ---------- Twitch data ----------
@@ -202,42 +201,100 @@ function sortRows(ul) {
     .forEach((li) => ul.append(li));
 }
 
-async function pool(items, size, fn) {
-  let i = 0;
-  await Promise.all(
-    Array.from({ length: size }, async () => {
-      while (i < items.length) await fn(items[i++]);
-    })
-  );
-}
-
-// ---------- render: cached first, refresh stale entries in the background ----------
-// What a cached entry needs:
-//   "full" = a complete one-channel lookup (never checked, failed before,
-//            "not on Kick" for over a week, or saved by an older version)
-//   "live" = only its live status (cheap: batched, 50 channels per request)
-//   null   = nothing, it's fresh
-// mode: "auto" = by those rules, "live" = also refresh live status for every
-// channel on Kick, "all" = full re-check of everyone.
+// ---------- render ----------
+// Opening the popup NEVER re-checks anything: it just draws what is saved.
+// Checks start in exactly two cases: the very first load (nothing saved yet)
+// and the ↻ button. They run in the background service worker, so closing the
+// popup can't interrupt them; this page just watches storage and updates.
+//
+// planFor says what a saved entry needs for a given mode:
+//   "view"    opening the popup           -> nothing, ever
+//   "initial" first load                  -> full lookup of never-checked channels
+//   "manual"  ↻                           -> full lookup of never-checked, failed,
+//                                            old-format or week-old "not on Kick"
+//                                            entries; live status for the rest
+//   "all"     Shift+↻                     -> full lookup of everyone
+// "full" = complete one-channel lookup, "live" = batched live-status refresh.
 
 function planFor(entry, mode, now) {
+  if (mode === "view") return null;
   if (mode === "all" || !entry) return "full";
+  if (mode === "initial") return null;
   const v = entry.value || {};
-  const age = now - entry.at;
-  if (v.failed) return age > FAIL_TTL ? "full" : null;
-  if (!v.kickSlug) return age > MISS_TTL ? "full" : null;
+  if (v.failed) return "full";
+  if (!v.kickSlug) return now - entry.at > MISS_TTL ? "full" : null;
   if (!v.kickUserId) return "full";
-  return mode === "live" || age > LIVE_TTL ? "live" : null;
+  return "live";
 }
 
-async function renderFromCache(list, mode = "auto") {
+let view = { list: [], rows: new Map(), results: new Map() };
+let scan = null; // storage.scanState, kept current by the listener below
+let uiTimer = null;
+
+const scanRunning = () => Boolean(scan?.running) && Date.now() - (scan.heartbeat || 0) < 20000;
+
+function updateStatus() {
+  const { list, results } = view;
+  if (!list.length) return;
+  let found = 0, liveNow = 0, unchecked = 0, failed = 0, oldest = Infinity;
+  for (const f of list) {
+    const e = results.get(f.login);
+    if (!e) { unchecked++; continue; }
+    if (e.value?.failed) { failed++; continue; }
+    if (!e.value?.kickSlug) continue;
+    found++;
+    if (e.value.isLive) liveNow++;
+    oldest = Math.min(oldest, e.at);
+  }
+  const parts = [`${list.length} follows`, `${found} on Kick`, `${liveNow} live`];
+  if (scanRunning()) {
+    parts.push(`checking ${scan.done}/${scan.total}…`);
+  } else {
+    if (scan?.limited) parts.push("Kick rate-limited the last check");
+    if (unchecked + failed) parts.push(`${unchecked + failed} not checked — press ↻`);
+    else if (found) parts.push(`updated ${fmtAgo(Date.now() - oldest)}`);
+  }
+  setStatus(parts.join(" · "));
+}
+
+function scheduleUI() {
+  clearTimeout(uiTimer);
+  uiTimer = setTimeout(() => {
+    if (!scanRunning()) sortRows($("rows")); // don't shuffle rows under your cursor mid-check
+    updateStatus();
+  }, 250);
+}
+
+// Results arrive via storage (written by the service worker as each lands).
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  let touched = false;
+  for (const [key, ch] of Object.entries(changes)) {
+    if (key === "scanState") {
+      scan = ch.newValue || null;
+      touched = true;
+    } else if (key.startsWith("kc:") && ch.newValue) {
+      const login = key.slice(3);
+      const li = view.rows.get(login);
+      if (!li) continue;
+      view.results.set(login, ch.newValue);
+      applyResult(li, ch.newValue.value);
+      touched = true;
+    }
+  }
+  if (touched) scheduleUI();
+});
+setInterval(updateStatus, 5000); // notices a worker that died mid-check
+
+async function renderFromCache(list, mode = "view") {
   const myRun = ++runId;
   currentList = list;
   showOnly("list");
 
-  // One batched read of everything we've ever looked up: no per-row waiting.
-  const cache = await chrome.storage.local.get(list.map((f) => `kc:${f.login}`));
+  // One batched read of everything saved: no per-row waiting.
+  const stored = await chrome.storage.local.get([...list.map((f) => `kc:${f.login}`), "scanState"]);
   if (myRun !== runId) return;
+  scan = stored.scanState || null;
 
   const ul = $("rows");
   ul.textContent = "";
@@ -252,83 +309,25 @@ async function renderFromCache(list, mode = "auto") {
     rows.set(f.login, li);
     ul.append(li);
 
-    const entry = cache[`kc:${f.login}`];
+    const entry = stored[`kc:${f.login}`];
     if (entry) {
       results.set(f.login, entry);
       applyResult(li, entry.value);
+    } else {
+      li._sub.textContent = "Not checked yet";
     }
     const p = planFor(entry, mode, now);
-    if (p === "full") full.push({ f, force: Boolean(entry) });
+    if (p === "full") full.push({ login: f.login, bio: f.bio, force: Boolean(entry) });
     else if (p === "live") live.push({ login: f.login, userId: entry.value.kickUserId });
   }
+  view = { list, rows, results };
   sortRows(ul); // same tick as the inserts, so no visible reshuffle
+  updateStatus();
 
-  let done = 0, limited = false, liveBusy = live.length > 0, liveFailed = false;
-  const update = () => {
-    let found = 0, liveNow = 0, oldest = Infinity;
-    for (const { value, at } of results.values()) {
-      if (!value?.kickSlug) continue;
-      found++;
-      if (value.isLive) liveNow++;
-      oldest = Math.min(oldest, at);
-    }
-    const parts = [`${list.length} follows`, `${found} on Kick`, `${liveNow} live`];
-    if (limited) parts.push("rate limited — reopen later to continue");
-    else if (done < full.length) parts.push(`checking ${done}/${full.length}…`);
-    else if (liveBusy) parts.push("updating live status…");
-    else if (liveFailed) parts.push("live update failed");
-    else if (found) parts.push(`updated ${fmtAgo(Date.now() - oldest)}`);
-    setStatus(parts.join(" · "));
-  };
-  update();
-
-  // Background work (not awaited, so the caller isn't blocked by it).
-  (async () => {
-    const tasks = [];
-
-    if (live.length) {
-      tasks.push((async () => {
-        const res = await chrome.runtime.sendMessage({ type: "LIVE_REFRESH", entries: live });
-        if (myRun !== runId) return;
-        liveBusy = false;
-        if (res?.error === "RATE_LIMIT") limited = true;
-        else if (res?.error) liveFailed = true;
-        else {
-          for (const [login, value] of Object.entries(res.results || {})) {
-            results.set(login, { value, at: Date.now() });
-            applyResult(rows.get(login), value);
-          }
-        }
-        sortRows(ul); // newly live channels float to the top right away
-        update();
-      })());
-    }
-
-    tasks.push(pool(full, 4, async ({ f, force }) => {
-      if (limited || myRun !== runId) return;
-      const li = rows.get(f.login);
-      const res = await chrome.runtime.sendMessage({
-        type: "LOOKUP_LITE", login: f.login, bio: f.bio, force,
-      });
-      if (myRun !== runId) return;
-      if (res?.error === "RATE_LIMIT") {
-        limited = true;
-      } else if (res?.error) {
-        if (li._sub.textContent === "Checking…") li._sub.textContent = `Error: ${res.error}`;
-      } else {
-        results.set(f.login, { value: res, at: Date.now() });
-        applyResult(li, res);
-      }
-      done++;
-      update();
-    }));
-
-    await Promise.all(tasks);
-    if (myRun === runId) {
-      sortRows(ul);
-      update();
-    }
-  })();
+  if (full.length || live.length) {
+    const res = await chrome.runtime.sendMessage({ type: "START_SCAN", full, live });
+    if (myRun === runId && res?.error) setStatus(`Couldn't start check: ${res.error}`);
+  }
 }
 
 // ---------- entry point ----------
@@ -356,11 +355,11 @@ async function main() {
 
   if (cached) {
     // Instant: draw from cache, then refresh the follow list quietly if it's old.
-    renderFromCache(cached.list);
+    renderFromCache(cached.list, "view");
     if (Date.now() - cached.at < FOLLOWS_TTL) return;
     try {
       const fresh = await fetchFollows(s.twitchId, user, true);
-      if (loginSet(fresh) !== loginSet(cached.list)) renderFromCache(fresh);
+      if (loginSet(fresh) !== loginSet(cached.list)) renderFromCache(fresh, "view");
     } catch (e) {
       onFollowsError(e);
     }
@@ -371,7 +370,7 @@ async function main() {
   showOnly("list");
   setStatus("Loading your follows…");
   try {
-    renderFromCache(await fetchFollows(s.twitchId, user, false));
+    renderFromCache(await fetchFollows(s.twitchId, user, false), "initial");
   } catch (e) {
     onFollowsError(e);
   }

@@ -7,8 +7,7 @@ const cache = new Map(); // login -> { at, value }
 
 const HANDLERS = {
   LOOKUP: (m) => lookup(m.login),               // content script (single channel)
-  LOOKUP_LITE: (m) => lookupLite(m.login, m.bio, m.force), // popup (full lookup of one channel)
-  LIVE_REFRESH: (m) => refreshLive(m.entries),             // popup (batched live status)
+  START_SCAN: (m) => startScan(m),               // popup: first load or the refresh button
   TWITCH_LOGIN: () => twitchLogin(),             // popup "Connect Twitch"
 };
 
@@ -296,4 +295,70 @@ async function refreshLive(entries) {
   }
   await chrome.storage.local.set(update);
   return { results };
+}
+
+// ---------- Scans run here, not in the popup ----------
+// Closing the popup can't interrupt a check: this worker keeps going, writes
+// each result to storage as it lands, and the popup just watches storage.
+// Progress lives in storage.scanState (with a heartbeat so a crashed worker
+// isn't mistaken for a running one).
+
+let activeScan = false;
+
+async function pool(items, size, fn) {
+  let i = 0;
+  await Promise.all(
+    Array.from({ length: size }, async () => {
+      while (i < items.length) await fn(items[i++]);
+    })
+  );
+}
+
+const isRateLimit = (e) => String(e?.message || e).includes("RATE_LIMIT");
+
+async function startScan({ full = [], live = [] }) {
+  if (activeScan) return { alreadyRunning: true };
+  const c = await getCreds();
+  if (!c.kickId || !c.kickSecret) return { error: "NO_CREDENTIALS" };
+
+  activeScan = true;
+  const total = full.length + live.length;
+  let done = 0, limited = false;
+  const save = (extra = {}) =>
+    chrome.storage.local.set({
+      scanState: { running: true, total, done, limited, heartbeat: Date.now(), ...extra },
+    });
+  await save();
+
+  // Deliberately not awaited: the popup gets an immediate reply and watches storage.
+  (async () => {
+    try {
+      const tasks = [];
+      if (live.length) {
+        tasks.push(
+          refreshLive(live)
+            .catch((e) => { if (isRateLimit(e)) limited = true; })
+            .then(() => { done += live.length; return save(); })
+        );
+      }
+      tasks.push(
+        pool(full, 4, async (it) => {
+          if (limited) return;
+          try {
+            await lookupLite(it.login, it.bio, it.force);
+          } catch (e) {
+            if (isRateLimit(e)) limited = true;
+          }
+          done++;
+          await save();
+        })
+      );
+      await Promise.all(tasks);
+    } finally {
+      activeScan = false;
+      await save({ running: false, finishedAt: Date.now() });
+    }
+  })();
+
+  return { started: true };
 }

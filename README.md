@@ -21,5 +21,11 @@ Steps:
 
 Once extension is added and if you want to update this app again, go to 'Manage Extensions' > Find 'Twitch to Kick Bridge' > Press 'Reload' 
 
-If you'd like to contribute to this, feel free to fork it, list your changes and I can update it.
+Settings:
+The refresh button -
+- Click: it refreshes live status for everyone on Kick, plus checks anything unchecked or failed, and anything marked “not on Kick” for over a week.
+- Shift+click: it re-checks every follow from scratch.
 
+-----
+
+If you'd like to contribute to this, feel free to fork it, list your changes and I can update it.
