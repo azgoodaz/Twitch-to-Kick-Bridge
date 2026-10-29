@@ -15,6 +15,11 @@
     .row button { margin-top: 0; }
     pre { background: #f4f4f5; padding: 10px; overflow: auto; border-radius: 6px; }
     small { color: #5c5c66; }
+    .conn { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid #e4e4e7; border-radius: 8px; margin-top: 8px; }
+    .btns { display: flex; gap: 8px; }
+    .btns button { margin-top: 0; }
+    button.secondary { background: #efeff1; border: 1px solid #d4d4d8; }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
@@ -26,6 +31,41 @@
     Minimal button on Twitch pages (live dot + “Kick” only)</label>
   <small>Applies instantly. Hover the button for details.</small>
 
+  <label style="font-weight:400"><input id="showBadge" type="checkbox" style="width:auto">
+    Show live count on the toolbar icon</label>
+  <small>The number of followed streamers who were live on Kick at the last check. It updates when a
+    check finishes (first load, or ↻ in the popup), not on its own.</small>
+
+  <h2>Connections</h2>
+  <small>Log in to your own accounts. Register this exact URL in <b>both</b> developer apps
+    (Twitch: “OAuth Redirect URLs”, Kick: the app's redirect URL):</small>
+  <p><code id="redirect"></code></p>
+
+  <div class="conn">
+    <div><strong>Twitch</strong><br><small id="twitchState">…</small></div>
+    <div class="btns">
+      <button id="twitchConnect">Connect</button>
+      <button id="twitchLogout" class="secondary" hidden>Log out</button>
+    </div>
+  </div>
+  <div class="conn">
+    <div><strong>Kick</strong><br><small id="kickState">…</small></div>
+    <div class="btns">
+      <button id="kickConnect">Connect</button>
+      <button id="kickLogout" class="secondary" hidden>Log out</button>
+    </div>
+  </div>
+  <p><small id="connMsg"></small></p>
+  <small>Twitch is used to read who you follow. Kick's public API doesn't offer a follow action (yet),
+    so the Kick login is saved for later and “Kick ↗” still opens their profile.</small>
+
+  <h2>Checking speed</h2>
+  <label style="font-weight:400">Check up to
+    <input id="rateBatch" type="number" min="10" max="1000" style="width:70px">
+    streamers every
+    <input id="rateMinutes" type="number" min="1" max="60" style="width:55px"> minutes</label>
+  <small>Lower this if Kick keeps rate-limiting you (default: 200 every 3 minutes). Applies to the next check.</small>
+
   <h2>Kick (required)</h2>
   <small>Create an app at kick.com/settings/developer</small>
   <label for="kickId">Client ID</label>
@@ -35,7 +75,6 @@
 
   <h2>Twitch</h2>
   <small>Create an app at dev.twitch.tv/console. The Client ID is needed for the followed-streamers popup; the secret is only used for the bio cross-check on channel pages.</small>
-  <p><small>Add this exact URL under your Twitch app's <b>OAuth Redirect URLs</b>:<br><code id="redirect"></code></small></p>
   <label for="twitchId">Client ID</label>
   <input id="twitchId" autocomplete="off">
   <label for="twitchSecret">Client Secret</label>

@@ -24,6 +24,12 @@
     .row.nokick { display: none; }
     #rows.liveOnly .row:not(.live) { display: none !important; }
     #rows.showAll .row.nokick { display: flex; opacity: .55; }
+    #searchWrap { padding: 8px 12px 0; }
+    #search { width: 100%; box-sizing: border-box; padding: 7px 9px; font: inherit; border: 1px solid #d4d4d8; border-radius: 6px; }
+    #noMatch { padding: 14px 12px; color: #5c5c66; text-align: center; }
+    .row.nomatch { display: none !important; }
+    /* while searching, also show streamers who aren't on Kick (dimmed) so you can see "not on Kick" */
+    #rows.searching .row.nokick { display: flex; opacity: .55; }
     [hidden] { display: none !important; }
   </style>
 </head>
@@ -42,10 +48,14 @@
   </div>
 
   <div id="list" hidden>
+    <div id="searchWrap">
+      <input id="search" type="search" placeholder="Search streamers by name…" autocomplete="off" spellcheck="false">
+    </div>
     <div id="bar">
       <span id="status">Loading…</span>
       <span class="opts"><button id="refresh" title="Refresh live status (Shift+click: recheck everyone)">↻</button><label><input type="checkbox" id="liveOnly"> live only</label><label><input type="checkbox" id="showAll"> show not on Kick</label></span>
     </div>
+    <div id="noMatch" hidden></div>
     <ul id="rows"></ul>
   </div>
 

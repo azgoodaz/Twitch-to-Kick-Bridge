@@ -5,7 +5,8 @@
   "description": "Shows a Kick profile button on Twitch channels when the streamer is also on Kick.",
   "permissions": [
     "storage",
-    "identity"
+    "identity",
+    "alarms"
   ],
   "host_permissions": [
     "https://www.twitch.tv/*",

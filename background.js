@@ -8,7 +8,10 @@ const cache = new Map(); // login -> { at, value }
 const HANDLERS = {
   LOOKUP: (m) => lookup(m.login),               // content script (single channel)
   START_SCAN: (m) => startScan(m),               // popup: first load or the refresh button
-  TWITCH_LOGIN: () => twitchLogin(),             // popup "Connect Twitch"
+  TWITCH_LOGIN: () => twitchLogin(),             // popup / settings: connect Twitch
+  TWITCH_LOGOUT: () => twitchLogout(),           // settings / popup: log out of Twitch
+  KICK_LOGIN: () => kickLogin(),                 // settings: connect Kick
+  KICK_LOGOUT: () => kickLogout(),               // settings: log out of Kick
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -92,7 +95,7 @@ async function kickChannel(slug, c) {
     );
     if (r.status === 401 && !force) continue;
     if (r.status === 404 || r.status === 400) return null; // unknown slug
-    if (r.status === 429) throw new Error("RATE_LIMIT");
+    if (r.status === 429) throw rateLimitError(r);
     if (!r.ok) throw new Error(`Kick API error ${r.status}`);
     return (await r.json()).data?.[0] ?? null;
   }
@@ -263,7 +266,7 @@ async function kickGet(url, c) {
     const token = await kickToken(c, force);
     const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
     if (r.status === 401 && !force) continue;
-    if (r.status === 429) throw new Error("RATE_LIMIT");
+    if (r.status === 429) throw rateLimitError(r);
     if (!r.ok) throw new Error(`Kick API error ${r.status}`);
     return (await r.json()).data ?? [];
   }
@@ -298,67 +301,305 @@ async function refreshLive(entries) {
 }
 
 // ---------- Scans run here, not in the popup ----------
-// Closing the popup can't interrupt a check: this worker keeps going, writes
-// each result to storage as it lands, and the popup just watches storage.
-// Progress lives in storage.scanState (with a heartbeat so a crashed worker
-// isn't mistaken for a running one).
+// A scan is a persistent queue (storage.scanItems / scanIndex) worked through at
+// a steady, configurable pace (default: 200 streamers per 3 minutes) so Kick's
+// rate limit isn't hit. Closing the popup can't interrupt it. If Kick still says
+// "slow down" the scan backs off, slows itself down and carries on. If Chrome
+// stops this worker, an alarm wakes it and it resumes from the saved position.
+// Progress is published in storage.scanState; the popup just watches it.
 
 let activeScan = false;
+const WATCHDOG = "kick-bridge-scan";
 
-async function pool(items, size, fn) {
-  let i = 0;
-  await Promise.all(
-    Array.from({ length: size }, async () => {
-      while (i < items.length) await fn(items[i++]);
-    })
-  );
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+const isRateLimit = (e) => String(e?.message || e).includes("RATE_LIMIT");
+
+function rateLimitError(r) {
+  const e = new Error("RATE_LIMIT");
+  const secs = Number(r.headers?.get?.("Retry-After"));
+  if (secs > 0) e.retryAfterMs = Math.min(secs * 1000, 10 * 60 * 1000);
+  return e;
 }
 
-const isRateLimit = (e) => String(e?.message || e).includes("RATE_LIMIT");
+// Long waits are cut into short slices with a storage write in between:
+// extension API calls keep the service worker alive, one long timer would not.
+async function sleepAlive(ms, beat) {
+  let left = ms;
+  while (left > 0) {
+    const slice = Math.min(10_000, left);
+    await sleep(slice);
+    left -= slice;
+    if (ms > 10_000) await beat();
+  }
+}
 
 async function startScan({ full = [], live = [] }) {
   if (activeScan) return { alreadyRunning: true };
   const c = await getCreds();
   if (!c.kickId || !c.kickSecret) return { error: "NO_CREDENTIALS" };
 
-  activeScan = true;
-  const total = full.length + live.length;
-  let done = 0, limited = false;
-  const save = (extra = {}) =>
-    chrome.storage.local.set({
-      scanState: { running: true, total, done, limited, heartbeat: Date.now(), ...extra },
-    });
-  await save();
-
-  // Deliberately not awaited: the popup gets an immediate reply and watches storage.
-  (async () => {
-    try {
-      const tasks = [];
-      if (live.length) {
-        tasks.push(
-          refreshLive(live)
-            .catch((e) => { if (isRateLimit(e)) limited = true; })
-            .then(() => { done += live.length; return save(); })
-        );
-      }
-      tasks.push(
-        pool(full, 4, async (it) => {
-          if (limited) return;
-          try {
-            await lookupLite(it.login, it.bio, it.force);
-          } catch (e) {
-            if (isRateLimit(e)) limited = true;
-          }
-          done++;
-          await save();
-        })
-      );
-      await Promise.all(tasks);
-    } finally {
-      activeScan = false;
-      await save({ running: false, finishedAt: Date.now() });
-    }
-  })();
-
+  await chrome.storage.local.set({
+    scanItems: full.map((x) => ({ login: x.login, force: Boolean(x.force) })),
+    scanIndex: 0,
+    scanLive: live,
+    scanTotal: full.length + live.length,
+  });
+  chrome.alarms.create(WATCHDOG, { periodInMinutes: 1 });
+  runQueue(); // deliberately not awaited: the popup gets an instant reply
   return { started: true };
+}
+
+async function runQueue() {
+  if (activeScan) return;
+  activeScan = true;
+  const st = { running: true, total: 0, done: 0, pausedUntil: 0, etaMs: 0, limited: false, liveFailed: false, heartbeat: 0 };
+  const saveState = (extra = {}) => {
+    Object.assign(st, extra);
+    st.heartbeat = Date.now();
+    return chrome.storage.local.set({ scanState: { ...st } });
+  };
+
+  try {
+    const s = await chrome.storage.local.get([
+      "scanItems", "scanIndex", "scanLive", "scanTotal", "rateBatch", "rateMinutes", "followsCache",
+    ]);
+    const items = s.scanItems || [];
+    let index = s.scanIndex || 0;
+    const live = s.scanLive || [];
+    const total = s.scanTotal || items.length + live.length;
+    const liveCount = total - items.length;
+
+    // Pace: `batch` checks spread evenly over `minutes`.
+    const batch = clamp(Math.round(Number(s.rateBatch) || 200), 10, 1000);
+    const minutes = clamp(Number(s.rateMinutes) || 3, 1, 60);
+    const base = (minutes * 60_000) / batch;
+    let interval = base;
+
+    const bios = new Map((s.followsCache?.list || []).map((f) => [f.login, f.bio]));
+
+    st.total = total;
+    st.done = (live.length ? 0 : liveCount) + index;
+    await saveState();
+
+    // 1) live status of everyone already known to be on Kick: one batched request per 50
+    if (live.length) {
+      try {
+        await refreshLive(live);
+      } catch (e) {
+        st.liveFailed = true;
+      }
+      await chrome.storage.local.set({ scanLive: [] });
+      st.done = liveCount + index;
+      await saveState();
+    }
+
+    // 2) full lookups, one at a time at the steady pace
+    let strikes = 0, backoff = 60_000;
+    while (index < items.length) {
+      const it = items[index];
+      const t0 = Date.now();
+      try {
+        await lookupLite(it.login, bios.get(it.login) || "", it.force);
+        strikes = 0;
+        backoff = 60_000;
+      } catch (e) {
+        if (!isRateLimit(e)) throw e;
+        if (++strikes > 6) { st.limited = true; break; } // give up; leftovers wait for ↻
+        const wait = e.retryAfterMs || backoff;
+        backoff = Math.min(backoff * 2, 10 * 60_000);
+        interval = Math.min(interval * 1.5, base * 4);   // be gentler for the rest of the scan
+        await saveState({ pausedUntil: Date.now() + wait });
+        await sleepAlive(wait, () => saveState());
+        await saveState({ pausedUntil: 0 });
+        continue; // retry the same streamer
+      }
+      index++;
+      st.done = liveCount + index;
+      st.etaMs = (items.length - index) * interval;
+      if (index % 10 === 0) await chrome.storage.local.set({ scanIndex: index });
+      await saveState();
+
+      const wait = interval - (Date.now() - t0);
+      if (wait > 0 && index < items.length) await sleepAlive(wait, () => saveState());
+    }
+  } catch (e) {
+    console.warn("[Kick Bridge] scan stopped:", e);
+    st.limited = isRateLimit(e);
+  }
+
+  // Finished (or gave up): drop the queue and the watchdog.
+  await chrome.storage.local.remove(["scanItems", "scanIndex", "scanLive", "scanTotal"]);
+  chrome.alarms.clear(WATCHDOG);
+  activeScan = false;
+  await saveState({ running: false, pausedUntil: 0, etaMs: 0, finishedAt: Date.now() });
+}
+
+// If Chrome stopped this worker mid-scan, pick the queue back up.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== WATCHDOG || activeScan) return;
+  const s = await chrome.storage.local.get(["scanItems", "scanIndex", "scanLive"]);
+  const pending = s.scanItems && ((s.scanIndex || 0) < s.scanItems.length || (s.scanLive || []).length);
+  if (pending) runQueue();
+  else chrome.alarms.clear(WATCHDOG);
+});
+
+// ---------- Toolbar badge (optional: Settings > Display) ----------
+// Shows how many followed streamers were live on Kick at the last check. It only
+// reads saved results and never starts a check, so the number moves when a check
+// finishes (first load, or ↻ in the popup).
+
+async function updateBadge() {
+  try {
+    const { showBadge, followsCache } = await chrome.storage.local.get(["showBadge", "followsCache"]);
+    const list = followsCache?.list || [];
+    if (!showBadge || !list.length) {
+      await chrome.action.setBadgeText({ text: "" });
+      await chrome.action.setTitle({ title: "Twitch → Kick Bridge" });
+      return;
+    }
+    const keys = list.map((f) => `kc:${f.login}`); // only people you still follow
+    const stored = await chrome.storage.local.get(keys);
+    let live = 0;
+    for (const k of keys) {
+      const v = stored[k]?.value;
+      if (v?.kickSlug && v.isLive) live++;
+    }
+    await chrome.action.setBadgeBackgroundColor({ color: "#53fc18" });
+    if (chrome.action.setBadgeTextColor) await chrome.action.setBadgeTextColor({ color: "#0b0e0f" });
+    await chrome.action.setBadgeText({ text: String(live) });
+    await chrome.action.setTitle({ title: `Twitch → Kick Bridge — ${live} live on Kick (last check)` });
+  } catch (e) {
+    console.debug("[Kick Bridge] badge update failed", e);
+  }
+}
+
+// Debounced: a paced scan writes a result every second or so; wait for a quiet moment.
+let badgeTimer = null;
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  const relevant = Object.keys(changes).some(
+    (k) => k === "showBadge" || k === "followsCache" || k.startsWith("kc:")
+  );
+  if (!relevant) return;
+  clearTimeout(badgeTimer);
+  badgeTimer = setTimeout(updateBadge, 2000);
+});
+chrome.runtime.onStartup.addListener(updateBadge);
+chrome.runtime.onInstalled.addListener(updateBadge);
+updateBadge(); // and whenever the worker wakes up
+
+// ---------- Connections (Settings > Connections) ----------
+// Twitch: used to read who you follow. Kick: your own Kick account, saved for
+// features that need it. Kick's public API has no follow action, so for now the
+// Kick login is only stored and shown; "Kick ↗" is still a link to their profile.
+// (These user tokens are separate from the app tokens used for lookups.)
+
+const b64url = (buf) =>
+  btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
+
+async function kickLogin() {
+  const c = await getCreds();
+  if (!c.kickId || !c.kickSecret) throw new Error("Add your Kick Client ID and Secret first.");
+
+  // PKCE (required by Kick)
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+  const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  const state = crypto.randomUUID();
+  const redirect = chrome.identity.getRedirectURL();
+
+  const authUrl =
+    "https://id.kick.com/oauth/authorize?" +
+    new URLSearchParams({
+      response_type: "code",
+      client_id: c.kickId,
+      redirect_uri: redirect,
+      scope: "user:read",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state,
+    });
+
+  const redirected = await chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true });
+  const params = new URL(redirected).searchParams;
+  if (params.get("state") !== state) throw new Error("Login state mismatch.");
+  const code = params.get("code");
+  if (!code) throw new Error(params.get("error_description") || params.get("error") || "No authorization code returned.");
+
+  const r = await fetch("https://id.kick.com/oauth/token", {
+    method: "POST",
+    headers: FORM,
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      client_id: c.kickId,
+      client_secret: c.kickSecret,
+      redirect_uri: redirect,
+      code_verifier: verifier,
+    }),
+  });
+  if (!r.ok) throw new Error(`Kick token exchange failed (${r.status}).`);
+  const t = await r.json();
+
+  // Who just logged in? (/users with no ids returns the token's owner.)
+  let name = null, userId = null;
+  try {
+    const u = await fetch("https://api.kick.com/public/v1/users", {
+      headers: { Authorization: `Bearer ${t.access_token}` },
+    });
+    if (u.ok) {
+      const d = (await u.json()).data?.[0];
+      name = d?.name ?? null;
+      userId = d?.user_id ?? null;
+    }
+  } catch (e) { /* the name is cosmetic */ }
+
+  await chrome.storage.local.set({
+    kickUser: {
+      accessToken: t.access_token,
+      refreshToken: t.refresh_token || null,
+      exp: Date.now() + (t.expires_in || 0) * 1000,
+      scope: t.scope || "",
+      userId,
+      name,
+    },
+  });
+  return { name };
+}
+
+// Log out = ask the provider to revoke the token (best effort) + forget it here.
+async function kickLogout() {
+  const { kickUser, kickId, kickSecret } = await chrome.storage.local.get(["kickUser", "kickId", "kickSecret"]);
+  if (kickUser && kickId) {
+    for (const [token, hint] of [[kickUser.accessToken, "access_token"], [kickUser.refreshToken, "refresh_token"]]) {
+      if (!token) continue;
+      try {
+        await fetch("https://id.kick.com/oauth/revoke", {
+          method: "POST",
+          headers: FORM,
+          body: new URLSearchParams({ token, token_type_hint: hint, client_id: kickId, client_secret: kickSecret || "" }),
+        });
+      } catch (e) { /* offline or rejected: we still forget it locally */ }
+    }
+  }
+  await chrome.storage.local.remove("kickUser"); // keeps the app token used for lookups
+  return { ok: true };
+}
+
+async function twitchLogout() {
+  const { twitchUser, twitchId } = await chrome.storage.local.get(["twitchUser", "twitchId"]);
+  if (twitchUser?.token && twitchId) {
+    try {
+      await fetch("https://id.twitch.tv/oauth2/revoke", {
+        method: "POST",
+        headers: FORM,
+        body: new URLSearchParams({ client_id: twitchId, token: twitchUser.token }),
+      });
+    } catch (e) { /* still forget it locally */ }
+  }
+  // The follow list belongs to the logged-in account, so it goes too.
+  await chrome.storage.local.remove(["twitchUser", "followsCache"]);
+  return { ok: true };
 }

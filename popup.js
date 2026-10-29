@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 const FOLLOWS_TTL = 60 * 60 * 1000;          // your follow list: 1 hour
 const MISS_TTL = 7 * 24 * 60 * 60 * 1000;    // "not on Kick": 1 week
 
+let searchFocused = false;
 let runId = 0;          // bumps on every render so older background checks stop themselves
 let currentList = [];   // the follow list currently on screen
 
@@ -31,13 +32,18 @@ function fmtAgo(ms) {
   return `${Math.floor(m / 60)}h ago`;
 }
 
+function fmtCountdown(ms) {
+  const s = Math.ceil(ms / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+}
+
 // ---------- header / controls ----------
 
 $("settings").addEventListener("click", () => chrome.runtime.openOptionsPage());
 
 $("disconnect").addEventListener("click", async () => {
   runId++;
-  await chrome.storage.local.remove(["twitchUser", "followsCache"]);
+  await chrome.runtime.sendMessage({ type: "TWITCH_LOGOUT" });
   showConnect("Disconnected. Connect again to reload your follows.");
 });
 
@@ -60,6 +66,7 @@ $("showAll").addEventListener("change", (e) => {
 function applyLiveOnly(on) {
   $("liveOnly").checked = on;
   $("rows").classList.toggle("liveOnly", on);
+  applySearch(); // keeps the "no match" message accurate
 }
 $("liveOnly").addEventListener("change", (e) => {
   applyLiveOnly(e.target.checked);
@@ -72,6 +79,41 @@ chrome.storage.local.get("liveOnly").then((s) => applyLiveOnly(Boolean(s.liveOnl
 //   Shift+click = re-check every follow from scratch (e.g. someone just joined Kick)
 $("refresh").addEventListener("click", (e) => {
   if (currentList.length) renderFromCache(currentList, e.shiftKey ? "all" : "manual");
+});
+
+// ---------- search ----------
+// Filters by display name or login as you type. While a search is active,
+// streamers who aren't on Kick are shown too (dimmed), so you can also use it to
+// answer "is X on Kick?". Combines with the "live only" filter.
+function applySearch() {
+  const raw = $("search").value.trim();
+  const q = raw.toLowerCase();
+  const liveOnly = $("liveOnly").checked;
+  const ul = $("rows");
+  ul.classList.toggle("searching", q !== "");
+
+  let visible = 0;
+  for (const li of ul.children) {
+    const hit = !q || li.dataset.name.includes(q) || (li.dataset.login || "").includes(q);
+    li.classList.toggle("nomatch", !hit);
+    if (hit && (!liveOnly || li.classList.contains("live"))) visible++;
+  }
+  const none = q !== "" && visible === 0;
+  $("noMatch").hidden = !none;
+  if (none) {
+    $("noMatch").textContent = liveOnly
+      ? `No live streamer matches “${raw}”.`
+      : `No followed streamer matches “${raw}”.`;
+  }
+}
+
+$("search").addEventListener("input", applySearch);
+$("search").addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && $("search").value) {
+    e.preventDefault();
+    $("search").value = "";
+    applySearch();
+  }
 });
 
 // ---------- Twitch data ----------
@@ -121,6 +163,7 @@ function makeRow(f) {
   const li = document.createElement("li");
   li.className = "row nokick";
   li.dataset.name = f.name.toLowerCase();
+  li.dataset.login = f.login;
 
   const img = new Image();
   img.src = f.img;
@@ -248,9 +291,17 @@ function updateStatus() {
   }
   const parts = [`${list.length} follows`, `${found} on Kick`, `${liveNow} live`];
   if (scanRunning()) {
-    parts.push(`checking ${scan.done}/${scan.total}…`);
+    const wait = (scan.pausedUntil || 0) - Date.now();
+    if (wait > 0) {
+      parts.push(`rate limited — resuming in ${fmtCountdown(wait)}`);
+    } else {
+      let t = `checking ${scan.done}/${scan.total}`;
+      if (scan.etaMs > 60000) t += ` · ~${Math.round(scan.etaMs / 60000)} min left`;
+      parts.push(t + "…");
+    }
   } else {
-    if (scan?.limited) parts.push("Kick rate-limited the last check");
+    if (scan?.limited) parts.push("gave up after repeated rate limits");
+    if (scan?.liveFailed) parts.push("live update failed");
     if (unchecked + failed) parts.push(`${unchecked + failed} not checked — press ↻`);
     else if (found) parts.push(`updated ${fmtAgo(Date.now() - oldest)}`);
   }
@@ -284,12 +335,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
   if (touched) scheduleUI();
 });
-setInterval(updateStatus, 5000); // notices a worker that died mid-check
+setInterval(updateStatus, 1000); // countdowns, and notices a worker that died mid-check
 
 async function renderFromCache(list, mode = "view") {
   const myRun = ++runId;
   currentList = list;
   showOnly("list");
+  if (!searchFocused) {
+    searchFocused = true;
+    $("search").focus(); // start typing right away
+  }
 
   // One batched read of everything saved: no per-row waiting.
   const stored = await chrome.storage.local.get([...list.map((f) => `kc:${f.login}`), "scanState"]);
@@ -322,7 +377,12 @@ async function renderFromCache(list, mode = "view") {
   }
   view = { list, rows, results };
   sortRows(ul); // same tick as the inserts, so no visible reshuffle
+  applySearch(); // keep any text typed in the search box applied after a re-render
   updateStatus();
+
+  // Streamers whose Twitch bio mentions kick.com are certain hits: check them first.
+  const mentionsKick = (x) => (/kick\.com/i.test(x.bio) ? 0 : 1);
+  full.sort((a, b) => mentionsKick(a) - mentionsKick(b));
 
   if (full.length || live.length) {
     const res = await chrome.runtime.sendMessage({ type: "START_SCAN", full, live });
