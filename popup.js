@@ -4,6 +4,9 @@ const $ = (id) => document.getElementById(id);
 const FOLLOWS_TTL = 60 * 60 * 1000;          // your follow list: 1 hour
 const MISS_TTL = 7 * 24 * 60 * 60 * 1000;    // "not on Kick": 1 week
 
+const MAX_FAVS = 10;
+let favs = new Set();   // favorite streamers (Twitch logins); saved in storage.favorites
+let flashUntil = 0;     // a short message in the status line is showing until this time
 let searchFocused = false;
 let runId = 0;          // bumps on every render so older background checks stop themselves
 let currentList = [];   // the follow list currently on screen
@@ -194,10 +197,45 @@ function makeRow(f) {
     chrome.tabs.create({ url: a.href, active: false });
   });
 
-  li.append(img, mid, a);
+  const star = document.createElement("button");
+  star.className = "star";
+  star.hidden = true; // only streamers who are on Kick can be favorites
+  star.addEventListener("click", () => toggleFavorite(f.login));
+
+  li.append(star, img, mid, a);
   li._sub = sub;
   li._a = a;
+  li._star = star;
+  refreshRowFav(li);
   return li;
+}
+
+// Star state of one row (call after anything that could change it).
+function refreshRowFav(li) {
+  const on = favs.has(li.dataset.login);
+  li.classList.toggle("fav", on);
+  li.dataset.fav = on ? "1" : "0";
+  li._star.textContent = on ? "★" : "☆";
+  li._star.classList.toggle("on", on);
+  li._star.title = on ? "Remove from favorites" : "Add to favorites";
+  li._star.hidden = li.classList.contains("nokick");
+}
+
+function flash(msg) {
+  flashUntil = Date.now() + 3000;
+  setStatus(msg);
+}
+
+async function toggleFavorite(login) {
+  if (favs.has(login)) {
+    favs.delete(login);
+  } else {
+    if (favs.size >= MAX_FAVS) return flash(`You can have up to ${MAX_FAVS} favorites. Remove one first.`);
+    favs.add(login);
+  }
+  for (const li of view.rows.values()) refreshRowFav(li);
+  sortRows($("rows"));
+  await chrome.storage.local.set({ favorites: [...favs] });
 }
 
 // Safe to call repeatedly: updates a row in place from a lookup result.
@@ -223,10 +261,12 @@ function applyResult(li, res) {
     li._a.hidden = true;
     li._sub.textContent = res?.failed ? "Couldn't check — will retry later" : "Not on Kick";
   }
+  refreshRowFav(li);
 }
 
 function sortRows(ul) {
   const key = (li) => [
+    li.dataset.fav === "1" ? 0 : 1, // favorites always on top
     li.classList.contains("nokick") ? 1 : 0,
     -Number(li.dataset.live || 0),
     -Number(li.dataset.trust || 0),
@@ -277,6 +317,7 @@ let uiTimer = null;
 const scanRunning = () => Boolean(scan?.running) && Date.now() - (scan.heartbeat || 0) < 20000;
 
 function updateStatus() {
+  if (Date.now() < flashUntil) return; // let a short message be read
   const { list, results } = view;
   if (!list.length) return;
   let found = 0, liveNow = 0, unchecked = 0, failed = 0, oldest = Infinity;
@@ -321,7 +362,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   let touched = false;
   for (const [key, ch] of Object.entries(changes)) {
-    if (key === "scanState") {
+    if (key === "favorites") {
+      favs = new Set(ch.newValue || []);
+      for (const li of view.rows.values()) refreshRowFav(li);
+      sortRows($("rows"));
+    } else if (key === "scanState") {
       scan = ch.newValue || null;
       touched = true;
     } else if (key.startsWith("kc:") && ch.newValue) {
@@ -347,9 +392,10 @@ async function renderFromCache(list, mode = "view") {
   }
 
   // One batched read of everything saved: no per-row waiting.
-  const stored = await chrome.storage.local.get([...list.map((f) => `kc:${f.login}`), "scanState"]);
+  const stored = await chrome.storage.local.get([...list.map((f) => `kc:${f.login}`), "scanState", "favorites"]);
   if (myRun !== runId) return;
   scan = stored.scanState || null;
+  favs = new Set(stored.favorites || []);
 
   const ul = $("rows");
   ul.textContent = "";

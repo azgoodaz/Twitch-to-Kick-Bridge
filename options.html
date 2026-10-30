@@ -65,6 +65,21 @@
   <small>Twitch is used to read who you follow. Kick's public API doesn't offer a follow action (yet),
     so the Kick login is saved for later and “Kick ↗” still opens their profile.</small>
 
+  <h2>Favorites</h2>
+  <small>Star up to 10 streamers in the popup. They stay at the top of the list, and their live status is
+    checked automatically every hour (and right when you star someone).</small>
+  <label style="font-weight:400"><input id="notifyFavorites" type="checkbox" style="width:auto">
+    Notify me when a favorite goes live on Kick</label>
+  <div class="row" style="margin:6px 0 10px">
+    <button id="testNotify" class="secondary">Send test notification</button>
+    <button id="checkFavs" class="secondary">Check favorites now</button>
+    <small id="favMsg"></small>
+  </div>
+  <small id="favSummary"></small>
+  <div id="favList"></div>
+  <small>Hourly checks can't see a stream that starts and ends between two checks. Clicking a notification opens
+    their Kick channel.</small>
+
   <h2>Checking speed</h2>
   <label style="font-weight:400">Check up to
     <input id="rateBatch" type="number" min="10" max="1000" style="width:70px">

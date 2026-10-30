@@ -116,7 +116,7 @@ const bytesOf = (v) => new Blob([JSON.stringify(v)]).size;
 
 // all = everything in chrome.storage.local, total = bytes in use, quota = byte limit.
 // Returns [{ group } | { label, text, status }], status = "ok" | "warn" | "bad" | "".
-function buildDiagnostics(all, total, now, quota) {
+function buildDiagnostics(all, total, now, quota, extra = {}) {
   const rows = [];
   const group = (name) => rows.push({ group: name });
   const add = (label, text, status = "") => rows.push({ label, text, status });
@@ -169,6 +169,19 @@ function buildDiagnostics(all, total, now, quota) {
   else if (ss.finishedAt) add("Check", `Idle. Last finished ${ago(now - ss.finishedAt)}`, "ok");
   else add("Check", "Nothing checked yet");
 
+  const favList = all.favorites || [];
+  if (!favList.length) {
+    add("Favorites", "None starred");
+  } else {
+    const fc = all.favCheck;
+    const parts = [`${favList.length} favorite${favList.length > 1 ? "s" : ""}`];
+    parts.push(fc?.lastAt ? `last checked ${ago(now - fc.lastAt)}` : "not checked yet");
+    if (extra.favNextAt && extra.favNextAt > now) parts.push(`next in ${fmtDur(extra.favNextAt - now)}`);
+    parts.push(`notifications ${all.notifyFavorites ? "on" : "off"}`);
+    if (fc?.error) parts.push(`last attempt failed: ${fc.error}`);
+    add("Favorites", parts.join(", "), fc?.error ? "warn" : "ok");
+  }
+
   group("Cache");
   const entries = Object.entries(all).filter(([k]) => k.startsWith("kc:"));
   let found = 0, notOn = 0, failed = 0, oldest = Infinity, newest = 0, size = 0;
@@ -210,7 +223,8 @@ async function renderDiagnostics() {
   const all = await chrome.storage.local.get(null);
   const total = await chrome.storage.local.getBytesInUse(null);
   const quota = chrome.storage.local.QUOTA_BYTES || 10485760;
-  lastDiagRows = buildDiagnostics(all, total, Date.now(), quota);
+  const favAlarm = await chrome.alarms.get("kick-bridge-favs");
+  lastDiagRows = buildDiagnostics(all, total, Date.now(), quota, { favNextAt: favAlarm?.scheduledTime });
 
   const table = $("diag");
   table.textContent = "";
@@ -269,3 +283,83 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 setInterval(renderDiagnostics, 10000);
 renderDiagnostics();
+
+// ---------- Favorites ----------
+// ==== favorites-pure-start (no chrome.* calls in here, so it can be tested)
+// s = storage values, kc = the "kc:<login>" entries of the favorites, nextAt = next hourly check (ms) or undefined
+function buildFavorites(s, kc, nextAt, now) {
+  const favs = s.favorites || [];
+  const names = new Map((s.followsCache?.list || []).map((f) => [f.login, f.name]));
+  const parts = [`${favs.length} of 10 favorites`];
+  if (favs.length) {
+    parts.push(s.favCheck?.lastAt ? `last checked ${ago(now - s.favCheck.lastAt)}` : "not checked yet");
+    if (nextAt && nextAt > now) parts.push(`next check in ${fmtDur(nextAt - now)}`);
+    if (s.favCheck?.error) parts.push(`last attempt failed: ${s.favCheck.error}`);
+  }
+  const items = favs.map((login) => {
+    const v = kc[`kc:${login}`]?.value;
+    let text = "Not checked yet", status = "";
+    if (v?.failed) { text = "Couldn't check"; status = "warn"; }
+    else if (v && !v.kickSlug) { text = "Not on Kick"; status = "warn"; }
+    else if (v?.isLive) { text = "Live on Kick"; status = "ok"; }
+    else if (v) { text = "Offline on Kick"; }
+    return { login, name: names.get(login) || login, text, status };
+  });
+  return { summary: parts.join(" · "), items };
+}
+// ==== favorites-pure-end
+
+async function renderFavorites() {
+  const s = await chrome.storage.local.get(["favorites", "followsCache", "favCheck"]);
+  const kc = await chrome.storage.local.get((s.favorites || []).map((l) => `kc:${l}`));
+  const alarm = await chrome.alarms.get("kick-bridge-favs");
+  const { summary, items } = buildFavorites(s, kc, alarm?.scheduledTime, Date.now());
+
+  $("favSummary").textContent = summary;
+  const box = $("favList");
+  box.textContent = "";
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "conn";
+    const left = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = `★ ${it.name}`;
+    const state = document.createElement("small");
+    const dot = document.createElement("span");
+    dot.className = `dot ${it.status}`;
+    state.append(dot, document.createTextNode(it.text));
+    left.append(name, document.createElement("br"), state);
+
+    const remove = document.createElement("button");
+    remove.className = "secondary";
+    remove.style.marginTop = "0";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", async () => {
+      const { favorites = [] } = await chrome.storage.local.get("favorites");
+      await chrome.storage.local.set({ favorites: favorites.filter((l) => l !== it.login) });
+    });
+    row.append(left, remove);
+    box.append(row);
+  }
+}
+
+chrome.storage.local.get("notifyFavorites").then((s) => ($("notifyFavorites").checked = Boolean(s.notifyFavorites)));
+$("notifyFavorites").addEventListener("change", (e) => chrome.storage.local.set({ notifyFavorites: e.target.checked }));
+
+async function favAction(type, doing, done) {
+  $("favMsg").textContent = doing;
+  const res = await chrome.runtime.sendMessage({ type });
+  $("favMsg").textContent = res?.error ? `Failed: ${res.error}` : done(res);
+  setTimeout(() => ($("favMsg").textContent = ""), 5000);
+  renderFavorites();
+}
+$("testNotify").addEventListener("click", () => favAction("TEST_NOTIFICATION", "Sending…", () => "Sent. Check your system notifications."));
+$("checkFavs").addEventListener("click", () =>
+  favAction("CHECK_FAVORITES", "Checking…", (r) =>
+    r.skipped ? "A check is already running." : r.checked === 0 ? "No favorites yet." : `Checked ${r.checked}.`));
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && (changes.favorites || changes.favCheck || changes.followsCache)) renderFavorites();
+});
+setInterval(renderFavorites, 30000);
+renderFavorites();

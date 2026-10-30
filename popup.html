@@ -28,6 +28,10 @@
     #search { width: 100%; box-sizing: border-box; padding: 7px 9px; font: inherit; border: 1px solid #d4d4d8; border-radius: 6px; }
     #noMatch { padding: 14px 12px; color: #5c5c66; text-align: center; }
     .row.nomatch { display: none !important; }
+    .row.fav { background: #fffbea; }
+    .star { flex: none; background: none; color: #b4b4bb; border: 0; padding: 0 2px; font-size: 19px; line-height: 1; cursor: pointer; }
+    .star:hover { color: #f5a623; }
+    .star.on { color: #f5a623; }
     /* while searching, also show streamers who aren't on Kick (dimmed) so you can see "not on Kick" */
     #rows.searching .row.nokick { display: flex; opacity: .55; }
     [hidden] { display: none !important; }

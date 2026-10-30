@@ -13,6 +13,8 @@ const HANDLERS = {
   KICK_LOGIN: () => kickLogin(),                 // settings: connect Kick
   KICK_LOGOUT: () => kickLogout(),               // settings: log out of Kick
   CLEAR_CACHE: () => clearCache(),               // settings > Diagnostics
+  CHECK_FAVORITES: () => checkFavorites(),       // settings > Favorites: "Check now"
+  TEST_NOTIFICATION: () => testNotification(),   // settings > Favorites
   LOG_ERROR: (m) => recordError(m.source, m.message).then(() => ({ ok: true })), // popup -> diagnostics
 };
 
@@ -282,11 +284,18 @@ async function refreshLive(entries) {
   if (!c.kickId || !c.kickSecret) return { error: "NO_CREDENTIALS" };
 
   const liveIds = new Set();
+  const liveInfo = {}; // broadcaster id -> { title, category } for streams that are live
   for (let i = 0; i < entries.length; i += 50) {
     const q = new URLSearchParams();
     for (const e of entries.slice(i, i + 50)) q.append("broadcaster_user_id", e.userId);
     const data = await kickGet(`https://api.kick.com/public/v1/livestreams?${q}`, c);
-    for (const s of data) liveIds.add(String(s.broadcaster_user_id));
+    for (const s of data) {
+      liveIds.add(String(s.broadcaster_user_id));
+      liveInfo[String(s.broadcaster_user_id)] = {
+        title: s.stream_title || s.title || "",
+        category: s.category?.name || "",
+      };
+    }
   }
 
   const keys = entries.map((e) => `kc:${e.login}`);
@@ -302,7 +311,7 @@ async function refreshLive(entries) {
     results[e.login] = value;
   }
   await chrome.storage.local.set(update);
-  return { results };
+  return { results, liveInfo };
 }
 
 // ---------- Scans run here, not in the popup ----------
@@ -645,7 +654,7 @@ async function noteRateLimit(err) {
 // Everything here can be re-fetched. Logins, credentials and settings are kept.
 const CACHE_KEYS = [
   "followsCache", "scanState", "scanItems", "scanIndex", "scanLive", "scanTotal",
-  "kickToken", "twitchToken", "errorLog", "rateLimit",
+  "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck",
 ];
 
 async function clearCache() {
@@ -657,3 +666,140 @@ async function clearCache() {
   scanCancelled = false;
   return { removed: keys.length };
 }
+
+// ---------- Favorites: hourly check + "went live" notifications ----------
+// Up to 10 starred streamers (storage.favorites = list of Twitch logins). They
+// are the one thing checked automatically: every hour, and right after you star
+// someone. That is a single batched request for all of them (plus one full
+// lookup for any whose Kick id isn't known yet).
+//
+// A notification fires on a *transition*: the previous hourly check saw them
+// offline and this one sees them live. The first check after starring only
+// records a baseline, so starring someone who is already live stays quiet.
+// Hourly polling can't see a stream that starts and ends between two checks.
+
+const FAV_ALARM = "kick-bridge-favs";
+const FAV_RETRY_ALARM = "kick-bridge-favs-retry";
+const MAX_FAVS = 10;
+let favCheckRunning = false;
+
+async function ensureFavAlarm() {
+  const { favorites = [] } = await chrome.storage.local.get("favorites");
+  const existing = await chrome.alarms.get(FAV_ALARM);
+  if (favorites.length && !existing) chrome.alarms.create(FAV_ALARM, { delayInMinutes: 60, periodInMinutes: 60 });
+  if (!favorites.length && existing) await chrome.alarms.clear(FAV_ALARM);
+}
+
+async function checkFavorites(opts = {}) {
+  if (favCheckRunning) return { skipped: true };
+  favCheckRunning = true;
+  try {
+    const c = await getCreds();
+    if (!c.kickId || !c.kickSecret) return { error: "NO_CREDENTIALS" };
+
+    const s = await chrome.storage.local.get(["favorites", "notifyFavorites", "favState", "followsCache"]);
+    const favs = (s.favorites || []).slice(0, MAX_FAVS);
+    if (!favs.length) return { checked: 0, wentLive: 0 };
+    const list = s.followsCache?.list || [];
+    const names = new Map(list.map((f) => [f.login, f.name]));
+    const bios = new Map(list.map((f) => [f.login, f.bio]));
+    const prevState = s.favState || {};
+
+    // 1) We need each favorite's Kick user id. Look up any we don't have yet.
+    const stored = await chrome.storage.local.get(favs.map((l) => `kc:${l}`));
+    const entries = [];
+    for (const login of favs) {
+      let v = stored[`kc:${login}`]?.value;
+      if (!v?.kickSlug || !v.kickUserId) v = await lookupLite(login, bios.get(login) || "", true);
+      if (v?.kickSlug && v.kickUserId) entries.push({ login, userId: v.kickUserId });
+    }
+
+    // 2) One batched request for everyone's live status (also refreshes the shared cache).
+    let results = {}, liveInfo = {};
+    if (entries.length) ({ results, liveInfo } = await refreshLive(entries));
+
+    // 3) Compare with the previous hourly check.
+    const now = Date.now();
+    const nextState = {};
+    const wentLive = [];
+    for (const login of favs) {
+      const value = results[login];
+      if (!value) { // not on Kick / couldn't tell: keep whatever we knew
+        if (prevState[login]) nextState[login] = prevState[login];
+        continue;
+      }
+      const isLive = Boolean(value.isLive);
+      nextState[login] = { live: isLive, at: now };
+      if (isLive && prevState[login]?.live === false) {
+        wentLive.push({
+          slug: value.kickSlug,
+          name: names.get(login) || login,
+          info: liveInfo[String(value.kickUserId)],
+        });
+      }
+    }
+    await chrome.storage.local.set({ favState: nextState, favCheck: { lastAt: now, error: null } });
+    if (s.notifyFavorites) for (const w of wentLive) await notifyLive(w);
+    return { checked: favs.length, wentLive: wentLive.length };
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 200);
+    if (isRateLimit(e)) await noteRateLimit(e);
+    else await recordError("Favorites check", e);
+    await chrome.storage.local.set({ favCheck: { lastAt: Date.now(), error: msg } });
+    if (!opts.retry) chrome.alarms.create(FAV_RETRY_ALARM, { delayInMinutes: 5 }); // one retry, not a loop
+    return { error: msg };
+  } finally {
+    favCheckRunning = false;
+  }
+}
+
+async function notifyLive({ slug, name, info }) {
+  const message = [info?.title, info?.category].filter(Boolean).join(" · ") || "Click to open their channel";
+  chrome.notifications.create(`fav:${slug}:${Date.now()}`, {
+    type: "basic",
+    iconUrl: "icons/icon128.png",
+    title: `${name} is live on Kick`,
+    message,
+  });
+}
+
+chrome.notifications.onClicked.addListener((id) => {
+  const m = /^fav:([^:]+):\d+$/.exec(id);
+  if (!m) return;
+  chrome.tabs.create({ url: `https://kick.com/${encodeURIComponent(m[1])}` });
+  chrome.notifications.clear(id);
+});
+
+async function testNotification() {
+  const level = await new Promise((res) => chrome.notifications.getPermissionLevel(res));
+  if (level === "denied") {
+    throw new Error("Notifications are blocked for Chrome. Allow them in your system's notification settings.");
+  }
+  chrome.notifications.create(`test:${Date.now()}`, {
+    type: "basic",
+    iconUrl: "icons/icon128.png",
+    title: "Twitch → Kick Bridge",
+    message: "Notifications are working. You'll see one like this when a favorite goes live.",
+  });
+  return { ok: true };
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === FAV_ALARM) checkFavorites();
+  else if (alarm.name === FAV_RETRY_ALARM) checkFavorites({ retry: true });
+});
+
+// Starring someone: keep the alarm in sync and take their baseline right away.
+let favTimer = null;
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.favorites) return;
+  clearTimeout(favTimer);
+  favTimer = setTimeout(async () => {
+    await ensureFavAlarm();
+    const { favorites = [], favState = {} } = await chrome.storage.local.get(["favorites", "favState"]);
+    if (favorites.some((l) => !favState[l])) checkFavorites();
+  }, 2000);
+});
+chrome.runtime.onStartup.addListener(ensureFavAlarm);
+chrome.runtime.onInstalled.addListener(ensureFavAlarm);
+ensureFavAlarm(); // and whenever the worker wakes up
