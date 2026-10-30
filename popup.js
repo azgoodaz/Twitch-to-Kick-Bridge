@@ -393,6 +393,7 @@ async function renderFromCache(list, mode = "view") {
 // ---------- entry point ----------
 
 async function onFollowsError(e) {
+  chrome.runtime.sendMessage({ type: "LOG_ERROR", source: "Twitch follows", message: e.message }).catch(() => {});
   if (e.code === 401) {
     runId++;
     await chrome.storage.local.remove("twitchUser"); // keep the follow cache for after reconnect

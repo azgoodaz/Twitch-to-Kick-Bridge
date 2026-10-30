@@ -20,6 +20,12 @@
     .btns button { margin-top: 0; }
     button.secondary { background: #efeff1; border: 1px solid #d4d4d8; }
     [hidden] { display: none !important; }
+    table.diag { width: 100%; border-collapse: collapse; margin-top: 6px; }
+    table.diag th { text-align: left; font-weight: 600; width: 32%; vertical-align: top; padding: 5px 10px 5px 0; }
+    table.diag td { padding: 5px 0; word-break: break-word; }
+    table.diag tr.grp th { padding-top: 16px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #5c5c66; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: #a1a1aa; }
+    .dot.ok { background: #16a34a; } .dot.warn { background: #f59e0b; } .dot.bad { background: #dc2626; }
   </style>
 </head>
 <body>
@@ -88,6 +94,17 @@
     <button id="test">Test</button>
   </div>
   <pre id="out">—</pre>
+
+  <h2>Diagnostics</h2>
+  <small>What the extension knows about itself. No tokens or secrets are shown or copied.</small>
+  <table class="diag" id="diag"></table>
+  <div class="row" style="margin-top:12px">
+    <button id="clearCache" class="secondary">Clear cache</button>
+    <button id="copyDiag" class="secondary">Copy diagnostics</button>
+    <small id="diagMsg"></small>
+  </div>
+  <small>Clear cache removes saved lookups, the follow list, cached app tokens, error history and any running check.
+    Your logins, credentials and settings stay.</small>
 
   <script src="options.js"></script>
 </body>

@@ -12,6 +12,8 @@ const HANDLERS = {
   TWITCH_LOGOUT: () => twitchLogout(),           // settings / popup: log out of Twitch
   KICK_LOGIN: () => kickLogin(),                 // settings: connect Kick
   KICK_LOGOUT: () => kickLogout(),               // settings: log out of Kick
+  CLEAR_CACHE: () => clearCache(),               // settings > Diagnostics
+  LOG_ERROR: (m) => recordError(m.source, m.message).then(() => ({ ok: true })), // popup -> diagnostics
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -21,6 +23,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     .then(sendResponse)
     .catch((err) => {
       console.warn("[Kick Bridge] handler failed:", err);
+      if (isRateLimit(err)) noteRateLimit(err);
+      else recordError(msg.type, err);
       sendResponse({ error: String(err.message || err) });
     });
   return true; // async response
@@ -232,6 +236,7 @@ async function lookupLite(login, twitchBio, force = false) {
     kick = await kickChannel(kickSlugGuess(login), c);
   } catch (e) {
     if (String(e.message).includes("RATE_LIMIT")) throw e; // not cached: we stopped early
+    await recordError("Kick lookup", e);
     // Remember the failure for a while so every popup open doesn't retry it.
     const failed = { kickSlug: null, failed: true };
     await chrome.storage.local.set({ [key]: { at: Date.now(), value: failed } });
@@ -309,6 +314,7 @@ async function refreshLive(entries) {
 // Progress is published in storage.scanState; the popup just watches it.
 
 let activeScan = false;
+let scanCancelled = false; // set by "Clear cache" to stop a running scan
 const WATCHDOG = "kick-bridge-scan";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -326,7 +332,7 @@ function rateLimitError(r) {
 // extension API calls keep the service worker alive, one long timer would not.
 async function sleepAlive(ms, beat) {
   let left = ms;
-  while (left > 0) {
+  while (left > 0 && !scanCancelled) {
     const slice = Math.min(10_000, left);
     await sleep(slice);
     left -= slice;
@@ -388,6 +394,8 @@ async function runQueue() {
         await refreshLive(live);
       } catch (e) {
         st.liveFailed = true;
+        if (isRateLimit(e)) await noteRateLimit(e);
+        else await recordError("Live status refresh", e);
       }
       await chrome.storage.local.set({ scanLive: [] });
       st.done = liveCount + index;
@@ -396,7 +404,7 @@ async function runQueue() {
 
     // 2) full lookups, one at a time at the steady pace
     let strikes = 0, backoff = 60_000;
-    while (index < items.length) {
+    while (index < items.length && !scanCancelled) {
       const it = items[index];
       const t0 = Date.now();
       try {
@@ -405,6 +413,7 @@ async function runQueue() {
         backoff = 60_000;
       } catch (e) {
         if (!isRateLimit(e)) throw e;
+        await noteRateLimit(e);
         if (++strikes > 6) { st.limited = true; break; } // give up; leftovers wait for ↻
         const wait = e.retryAfterMs || backoff;
         backoff = Math.min(backoff * 2, 10 * 60_000);
@@ -426,13 +435,14 @@ async function runQueue() {
   } catch (e) {
     console.warn("[Kick Bridge] scan stopped:", e);
     st.limited = isRateLimit(e);
+    if (!isRateLimit(e)) await recordError("Scan", e);
   }
 
   // Finished (or gave up): drop the queue and the watchdog.
   await chrome.storage.local.remove(["scanItems", "scanIndex", "scanLive", "scanTotal"]);
   chrome.alarms.clear(WATCHDOG);
-  activeScan = false;
   await saveState({ running: false, pausedUntil: 0, etaMs: 0, finishedAt: Date.now() });
+  activeScan = false;
 }
 
 // If Chrome stopped this worker mid-scan, pick the queue back up.
@@ -602,4 +612,48 @@ async function twitchLogout() {
   // The follow list belongs to the logged-in account, so it goes too.
   await chrome.storage.local.remove(["twitchUser", "followsCache"]);
   return { ok: true };
+}
+
+// ---------- Diagnostics support (Settings > Diagnostics) ----------
+
+// Last few errors, newest first. Repeats of the same error within a minute are
+// merged into one line with a count so a bad batch can't flood the list.
+async function recordError(source, err) {
+  try {
+    const message = String(err?.message ?? err).slice(0, 300);
+    const { errorLog = [] } = await chrome.storage.local.get("errorLog");
+    const last = errorLog[0];
+    if (last && last.source === source && last.message === message && Date.now() - last.at < 60_000) {
+      last.at = Date.now();
+      last.count = (last.count || 1) + 1;
+    } else {
+      errorLog.unshift({ at: Date.now(), source, message, count: 1 });
+    }
+    await chrome.storage.local.set({ errorLog: errorLog.slice(0, 5) });
+  } catch (e) { /* diagnostics must never break the extension */ }
+}
+
+async function noteRateLimit(err) {
+  try {
+    const { rateLimit } = await chrome.storage.local.get("rateLimit");
+    await chrome.storage.local.set({
+      rateLimit: { lastAt: Date.now(), total: (rateLimit?.total || 0) + 1, retryAfterMs: err?.retryAfterMs || null },
+    });
+  } catch (e) { /* same */ }
+}
+
+// Everything here can be re-fetched. Logins, credentials and settings are kept.
+const CACHE_KEYS = [
+  "followsCache", "scanState", "scanItems", "scanIndex", "scanLive", "scanTotal",
+  "kickToken", "twitchToken", "errorLog", "rateLimit",
+];
+
+async function clearCache() {
+  scanCancelled = true; // a running scan stops at its next step
+  for (let i = 0; i < 150 && activeScan; i++) await sleep(100);
+  const all = await chrome.storage.local.get(null);
+  const keys = Object.keys(all).filter((k) => k.startsWith("kc:") || CACHE_KEYS.includes(k));
+  await chrome.storage.local.remove(keys);
+  scanCancelled = false;
+  return { removed: keys.length };
 }

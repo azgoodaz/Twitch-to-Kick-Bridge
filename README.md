@@ -1,6 +1,6 @@
 # Twitch to Kick Bridge
 
-Shows a Kick profile button on Twitch channels when the streamer is also on Kick.
+Shows a Kick profile button on Twitch channels when the streamer is also on Kick (a great tool to find/support multi-streamers).
 
 An extension like this wasn't available, and let's face it. It's hard to know what streamers are using Kick or not.
 
