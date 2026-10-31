@@ -14,6 +14,8 @@ const HANDLERS = {
   KICK_LOGOUT: () => kickLogout(),               // settings: log out of Kick
   CLEAR_CACHE: () => clearCache(),               // settings > Diagnostics
   CHECK_FAVORITES: () => checkFavorites(),       // settings > Favorites: "Check now"
+  SET_OVERRIDE: (m) => setOverride(m.login, m.verdict), // "not them" / "it's them" / undo
+  IMPORT_OVERRIDES: (m) => importOverrides(m.data),     // settings: restore corrections from an export file
   TEST_NOTIFICATION: () => testNotification(),   // settings > Favorites
   LOG_ERROR: (m) => recordError(m.source, m.message).then(() => ({ ok: true })), // popup -> diagnostics
 };
@@ -107,10 +109,102 @@ async function kickChannel(slug, c) {
   }
 }
 
-// Best effort: Kick's official public API doesn't seem to expose the verified
-// badge, so ask the unofficial v2 endpoint. It may fail (Cloudflare, format
-// changes) — in that case we return null and the UI just doesn't show a badge.
-async function kickVerifiedBadge(slug) {
+// ---------- Is this Kick account really them? ----------
+// Kick channels are matched by username, so a different person (or an impersonator)
+// can own the same name. Each match gets a confidence tier from several signals:
+//   confirmed   the Twitch bio links to the Kick channel (only the real streamer controls
+//               that), or Kick-verified + the same profile picture
+//   likely      Kick-verified, or the same profile picture
+//   suspected   different profile picture + not verified + a tiny Kick following
+//               (or a Twitch partner with almost no Kick following): possible impersonator
+//   unconfirmed same username and nothing else to go on
+// A link in the *Kick* bio back to Twitch is NOT counted: anyone can write that.
+// Matches you mark "not them" / "it's them" always win (storage.kickOverrides).
+
+// dHash: compare each pixel of a 9x8 greyscale thumbnail with its right neighbour.
+// Similar pictures give similar bit strings even after resizing or recompression.
+function dhashFromGray(g) {
+  let bits = "";
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) bits += g[y * 9 + x] > g[y * 9 + x + 1] ? "1" : "0";
+  return bits;
+}
+function hamming(a, b) {
+  let d = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+  return d;
+}
+const AVATAR_SAME_MAX = 10;        // of 64 bits: practically the same picture
+const AVATAR_DIFFERENT_MIN = 24;   // unrelated pictures land around 32; in between = inconclusive
+
+async function imageHash(url) {
+  try {
+    if (!url || typeof OffscreenCanvas === "undefined" || typeof createImageBitmap === "undefined") return null;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const bmp = await createImageBitmap(await r.blob());
+    const mid = new OffscreenCanvas(72, 64);                    // two steps = a cleaner downscale
+    const mctx = mid.getContext("2d");
+    mctx.fillStyle = "#fff";                                    // transparent logos -> white
+    mctx.fillRect(0, 0, 72, 64);
+    mctx.drawImage(bmp, 0, 0, 72, 64);
+    if (bmp.close) bmp.close();
+    const small = new OffscreenCanvas(9, 8);
+    const sctx = small.getContext("2d", { willReadFrequently: true });
+    sctx.imageSmoothingQuality = "high";
+    sctx.drawImage(mid, 0, 0, 9, 8);
+    const px = sctx.getImageData(0, 0, 9, 8).data;
+    const gray = [];
+    for (let i = 0; i < 72; i++) gray.push(0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2]);
+    return dhashFromGray(gray);
+  } catch (e) {
+    return null; // unknown, never a guess
+  }
+}
+
+function assessMatch({ twLinksKick, kickLinksTwitch, verified, followers, avatarDist, twType }) {
+  const avatar =
+    typeof avatarDist !== "number" ? "unknown"
+      : avatarDist <= AVATAR_SAME_MAX ? "same"
+      : avatarDist >= AVATAR_DIFFERENT_MIN ? "different"
+      : "unknown";
+  const partner = twType === "partner";
+  const known = typeof followers === "number";
+  const lowKick = known && followers < 100;
+  const partnerMismatch = partner && known && followers < 500;
+
+  let tier;
+  if (twLinksKick || (verified === true && avatar === "same")) tier = "confirmed";
+  else if (verified === true || avatar === "same") tier = "likely";
+  else if (avatar === "different" && (lowKick || partnerMismatch)) tier = "suspected";
+  else tier = "unconfirmed";
+
+  const good = [], bad = [];
+  if (twLinksKick) good.push("linked from the Twitch bio");
+  if (verified === true) good.push("Kick-verified");
+  if (avatar === "same") good.push("same profile picture");
+  if (avatar === "different") bad.push("different profile picture");
+  if (known && (lowKick || partnerMismatch)) bad.push(`only ${followers.toLocaleString("en-US")} follower${followers === 1 ? "" : "s"} on Kick`);
+  if (verified === false && (tier === "suspected" || tier === "unconfirmed")) bad.push("not Kick-verified");
+  if (partner && tier === "suspected") bad.push("Twitch partner");
+  if (kickLinksTwitch && !twLinksKick) {
+    if (verified === true) good.push("Kick bio mentions Twitch");
+    else bad.push("Kick bio mentions Twitch (anyone can write that)");
+  }
+  return { tier, reasons: tier === "suspected" || tier === "unconfirmed" ? [...bad, ...good] : [...good, ...bad] };
+}
+
+// The tier after your own corrections. "none" = you said it isn't them.
+// (Same small function lives in popup.js and content.js: keep them in sync.)
+function effectiveTier(v, override) {
+  if (override === "not") return "none";
+  if (override === "yes") return "confirmed";
+  return v?.tier || "unconfirmed";
+}
+
+// Best effort: Kick's official public API has no verified badge, follower count or
+// avatar, so ask the unofficial v2 endpoint. It may fail (Cloudflare, format
+// changes); then we return null and the match simply can't rise above "unconfirmed".
+async function kickProfile(slug) {
   try {
     const r = await fetch(
       `https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`,
@@ -118,14 +212,76 @@ async function kickVerifiedBadge(slug) {
     );
     if (!r.ok) return null;
     const j = await r.json();
-    return j.verified === undefined ? null : Boolean(j.verified);
+    return {
+      verified: j.verified === undefined ? null : Boolean(j.verified),
+      followers: typeof j.followers_count === "number" ? j.followers_count : null,
+      avatar: j.user?.profile_pic || null,
+    };
   } catch (e) {
-    console.debug("[Kick Bridge] verified-badge lookup failed", e);
+    console.debug("[Kick Bridge] profile lookup failed", e);
     return null;
   }
 }
 
-// ---------- matching ----------
+const PROFILE_TTL = 7 * 24 * 60 * 60 * 1000; // badge/followers/avatar rarely change: reuse for a week
+
+// Everything we keep about a found Kick channel. `tw` = { bio, img, type } from Twitch,
+// `prev` = the previously saved value, reused so a refresh doesn't repeat slow requests.
+async function buildKickValue({ login, kick, tw, prev }) {
+  const slug = kick.slug.toLowerCase();
+  // No Twitch info this time (e.g. no Twitch secret on a channel page)? Keep what we already knew.
+  const twLinksKick = typeof tw?.bio === "string"
+    ? tw.bio.toLowerCase().includes(`kick.com/${slug}`)
+    : Boolean(prev?.linked);
+  const kickLinksTwitch = (kick.channel_description || "").toLowerCase().includes(`twitch.tv/${login}`);
+
+  const old = prev
+    ? { verified: prev.kickVerified ?? null, followers: prev.kickFollowers ?? null, avatar: prev.kickAvatar ?? null, at: prev.profileAt }
+    : null;
+  let prof;
+  if (old?.at && Date.now() - old.at < PROFILE_TTL) {
+    prof = old;
+  } else {
+    const p = await kickProfile(kick.slug);
+    prof = p ? { ...p, at: Date.now() } : old?.at ? old : null;
+  }
+
+  let avatarDist = null;
+  const twImg = tw?.img || prev?.twAvatar || null;
+  const twType = tw?.type || prev?.twType || "";
+  const kAvatar = prof?.avatar || null;
+  if (twImg && kAvatar) {
+    if (prev && prev.kickAvatar === kAvatar && prev.twAvatar === twImg && typeof prev.avatarDist === "number") {
+      avatarDist = prev.avatarDist;
+    } else {
+      const [a, b] = await Promise.all([imageHash(twImg), imageHash(kAvatar)]);
+      avatarDist = a && b ? hamming(a, b) : null;
+    }
+  }
+
+  const { tier, reasons } = assessMatch({
+    twLinksKick, kickLinksTwitch,
+    verified: prof?.verified ?? null, followers: prof?.followers ?? null,
+    avatarDist, twType,
+  });
+  return {
+    kickSlug: kick.slug,
+    kickUserId: kick.broadcaster_user_id, // lets us batch live-status refreshes
+    isLive: Boolean(kick.stream?.is_live),
+    linked: twLinksKick,                  // the Twitch bio points at this Kick channel
+    kickLinksTwitch,
+    kickVerified: prof?.verified ?? null,
+    kickFollowers: prof?.followers ?? null,
+    kickAvatar: kAvatar,
+    twAvatar: twImg,
+    twType,
+    avatarDist,
+    tier,
+    reasons,
+    profileAt: prof?.at,          // when the badge/followers/avatar were last read OK
+    profileTriedAt: Date.now(),   // when we last tried (so a blocked endpoint isn't re-flagged forever)
+  };
+}
 
 async function lookup(login) {
   login = String(login || "").toLowerCase();
@@ -143,23 +299,18 @@ async function lookup(login) {
 
   let value = { kickSlug: null };
   if (kick?.slug) {
-    const slug = kick.slug.toLowerCase();
-    const twitchBio = (tw?.description || "").toLowerCase();
-    const kickBio = (kick.channel_description || "").toLowerCase();
-
-    // "linked" = one profile's bio points at the other (strong evidence they
-    // are the same person). This is separate from Kick's own verified badge.
-    const linked =
-      twitchBio.includes(`kick.com/${slug}`) ||
-      kickBio.includes(`twitch.tv/${login}`);
-
-    value = {
-      kickSlug: kick.slug,
-      isLive: Boolean(kick.stream?.is_live),
-      linked,
-      kickVerified: await kickVerifiedBadge(kick.slug), // true / false / null (unknown)
-      title: kick.stream_title || "",
-    };
+    const got = await chrome.storage.local.get([`kc:${login}`, "followsCache"]);
+    const saved = got[`kc:${login}`]?.value;
+    const followed = (got.followsCache?.list || []).find((f) => f.login === login);
+    const built = await buildKickValue({
+      login,
+      kick,
+      tw: tw
+        ? { bio: tw.description, img: tw.profile_image_url, type: tw.broadcaster_type }
+        : followed && { bio: followed.bio, img: followed.img, type: followed.type },
+      prev: saved?.kickSlug ? saved : undefined, // reuse what the popup already worked out
+    });
+    value = { ...built, title: kick.stream_title || "" };
   }
 
   cache.set(login, { at: Date.now(), value });
@@ -221,8 +372,9 @@ async function twitchLogin() {
 const FOUND_TTL = 2 * 60 * 1000;                 // live status goes stale quickly
 const MISS_TTL = 7 * 24 * 60 * 60 * 1000;        // "not on Kick" rarely changes
 
-async function lookupLite(login, twitchBio, force = false) {
+async function lookupLite(login, twOrBio, force = false) {
   login = String(login || "").toLowerCase();
+  const tw = typeof twOrBio === "string" ? { bio: twOrBio } : twOrBio || {}; // { bio, img, type } from Twitch
   const key = `kc:${login}`;
   const stored = (await chrome.storage.local.get(key))[key];
   if (stored && !force) {
@@ -246,18 +398,7 @@ async function lookupLite(login, twitchBio, force = false) {
   }
   let value = { kickSlug: null };
   if (kick?.slug) {
-    const slug = kick.slug.toLowerCase();
-    const linked =
-      (twitchBio || "").toLowerCase().includes(`kick.com/${slug}`) ||
-      (kick.channel_description || "").toLowerCase().includes(`twitch.tv/${login}`);
-    value = {
-      kickSlug: kick.slug,
-      kickUserId: kick.broadcaster_user_id, // lets us batch live-status refreshes
-      isLive: Boolean(kick.stream?.is_live),
-      linked,
-      // the badge almost never changes: reuse it on refreshes (saves a request)
-      kickVerified: stored?.value?.kickVerified ?? (await kickVerifiedBadge(kick.slug)),
-    };
+    value = await buildKickValue({ login, kick, tw, prev: stored?.value?.kickSlug ? stored.value : undefined });
   }
   await chrome.storage.local.set({ [key]: { at: Date.now(), value } });
   return value;
@@ -391,7 +532,7 @@ async function runQueue() {
     const base = (minutes * 60_000) / batch;
     let interval = base;
 
-    const bios = new Map((s.followsCache?.list || []).map((f) => [f.login, f.bio]));
+    const twInfo = new Map((s.followsCache?.list || []).map((f) => [f.login, { bio: f.bio, img: f.img, type: f.type }]));
 
     st.total = total;
     st.done = (live.length ? 0 : liveCount) + index;
@@ -417,7 +558,7 @@ async function runQueue() {
       const it = items[index];
       const t0 = Date.now();
       try {
-        await lookupLite(it.login, bios.get(it.login) || "", it.force);
+        await lookupLite(it.login, twInfo.get(it.login) || {}, it.force);
         strikes = 0;
         backoff = 60_000;
       } catch (e) {
@@ -470,7 +611,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 async function updateBadge() {
   try {
-    const { showBadge, followsCache } = await chrome.storage.local.get(["showBadge", "followsCache"]);
+    const { showBadge, followsCache, kickOverrides = {} } = await chrome.storage.local.get(["showBadge", "followsCache", "kickOverrides"]);
     const list = followsCache?.list || [];
     if (!showBadge || !list.length) {
       await chrome.action.setBadgeText({ text: "" });
@@ -480,9 +621,10 @@ async function updateBadge() {
     const keys = list.map((f) => `kc:${f.login}`); // only people you still follow
     const stored = await chrome.storage.local.get(keys);
     let live = 0;
-    for (const k of keys) {
-      const v = stored[k]?.value;
-      if (v?.kickSlug && v.isLive) live++;
+    for (const f of list) {
+      const v = stored[`kc:${f.login}`]?.value;
+      const t = effectiveTier(v, kickOverrides[f.login]);
+      if (v?.kickSlug && v.isLive && t !== "suspected" && t !== "none") live++; // lookalikes don't count
     }
     await chrome.action.setBadgeBackgroundColor({ color: "#53fc18" });
     if (chrome.action.setBadgeTextColor) await chrome.action.setBadgeTextColor({ color: "#0b0e0f" });
@@ -498,7 +640,7 @@ let badgeTimer = null;
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   const relevant = Object.keys(changes).some(
-    (k) => k === "showBadge" || k === "followsCache" || k.startsWith("kc:")
+    (k) => k === "showBadge" || k === "followsCache" || k === "kickOverrides" || k.startsWith("kc:")
   );
   if (!relevant) return;
   clearTimeout(badgeTimer);
@@ -697,12 +839,13 @@ async function checkFavorites(opts = {}) {
     const c = await getCreds();
     if (!c.kickId || !c.kickSecret) return { error: "NO_CREDENTIALS" };
 
-    const s = await chrome.storage.local.get(["favorites", "notifyFavorites", "favState", "followsCache"]);
+    const s = await chrome.storage.local.get(["favorites", "notifyFavorites", "favState", "followsCache", "kickOverrides"]);
+    const overrides = s.kickOverrides || {};
     const favs = (s.favorites || []).slice(0, MAX_FAVS);
     if (!favs.length) return { checked: 0, wentLive: 0 };
     const list = s.followsCache?.list || [];
     const names = new Map(list.map((f) => [f.login, f.name]));
-    const bios = new Map(list.map((f) => [f.login, f.bio]));
+    const twInfo = new Map(list.map((f) => [f.login, { bio: f.bio, img: f.img, type: f.type }]));
     const prevState = s.favState || {};
 
     // 1) We need each favorite's Kick user id. Look up any we don't have yet.
@@ -710,8 +853,9 @@ async function checkFavorites(opts = {}) {
     const entries = [];
     for (const login of favs) {
       let v = stored[`kc:${login}`]?.value;
-      if (!v?.kickSlug || !v.kickUserId) v = await lookupLite(login, bios.get(login) || "", true);
-      if (v?.kickSlug && v.kickUserId) entries.push({ login, userId: v.kickUserId });
+      if (!v?.kickSlug || !v.kickUserId) v = await lookupLite(login, twInfo.get(login) || {}, true);
+      const t = effectiveTier(v, overrides[login]);
+      if (v?.kickSlug && v.kickUserId && t !== "suspected" && t !== "none") entries.push({ login, userId: v.kickUserId });
     }
 
     // 2) One batched request for everyone's live status (also refreshes the shared cache).
@@ -803,3 +947,70 @@ chrome.storage.onChanged.addListener((changes, area) => {
 chrome.runtime.onStartup.addListener(ensureFavAlarm);
 chrome.runtime.onInstalled.addListener(ensureFavAlarm);
 ensureFavAlarm(); // and whenever the worker wakes up
+
+// ---------- Your corrections ("not them" / "it's them") ----------
+// storage.kickOverrides = { login: "yes" | "not" }. They survive Clear cache: they're
+// your decisions, not cached data. Marking someone "not them" also un-stars them.
+async function setOverride(login, verdict) {
+  login = String(login || "").toLowerCase();
+  if (login === "__proto__") return { ok: false };
+  const { kickOverrides = {}, kickOverrideTimes = {}, favorites = [] } =
+    await chrome.storage.local.get(["kickOverrides", "kickOverrideTimes", "favorites"]);
+  if (verdict === "yes" || verdict === "not") kickOverrides[login] = verdict;
+  else delete kickOverrides[login];
+  // "It's them" gets a short Undo window; the time is what the popup/page use to retire the Undo link.
+  if (verdict === "yes") kickOverrideTimes[login] = Date.now();
+  else delete kickOverrideTimes[login];
+  for (const l of Object.keys(kickOverrideTimes)) if (kickOverrides[l] !== "yes") delete kickOverrideTimes[l];
+  const update = { kickOverrides, kickOverrideTimes };
+  if (verdict === "not" && favorites.includes(login)) update.favorites = favorites.filter((l) => l !== login);
+  await chrome.storage.local.set(update);
+  return { ok: true };
+}
+
+// Restore corrections from a file made by Settings > Match corrections > Export.
+// Validated strictly (it's a file from outside): known app + version, sane logins, only
+// "yes"/"not". Imported entries win over existing ones for the same streamer. Imported
+// confirmations are settled, so they get no Undo window.
+const LOGIN_RE = /^[a-z0-9_]{1,25}$/;
+const own = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key); // `in` would also match "constructor", "toString"...
+const MAX_IMPORT = 5000;
+
+async function importOverrides(data) {
+  if (!data || typeof data !== "object" || data.app !== "twitch-kick-bridge") {
+    throw new Error("This file isn't a Twitch → Kick Bridge export.");
+  }
+  if (!(Number(data.version) >= 1)) throw new Error("This file isn't a Twitch → Kick Bridge export.");
+  if (Number(data.version) > 1) throw new Error("This export was made by a newer version of the extension.");
+  const src = data.overrides;
+  if (!src || typeof src !== "object" || Array.isArray(src)) throw new Error("This export has no corrections in it.");
+  const entries = Object.entries(src);
+  if (entries.length > MAX_IMPORT) throw new Error(`Too many entries (the limit is ${MAX_IMPORT}).`);
+
+  const clean = {};
+  let skipped = 0;
+  for (const [raw, verdict] of entries) {
+    const login = String(raw).trim().toLowerCase();
+    // "__proto__" is a valid-looking login but can't be stored as a key; skip it rather than lose it silently
+    if (LOGIN_RE.test(login) && login !== "__proto__" && (verdict === "yes" || verdict === "not")) clean[login] = verdict;
+    else skipped++;
+  }
+
+  const { kickOverrides = {}, kickOverrideTimes = {}, favorites = [] } =
+    await chrome.storage.local.get(["kickOverrides", "kickOverrideTimes", "favorites"]);
+  let added = 0, updated = 0, unchanged = 0;
+  for (const [login, verdict] of Object.entries(clean)) {
+    if (!own(kickOverrides, login)) added++;
+    else if (kickOverrides[login] !== verdict) updated++;
+    else unchanged++;
+    kickOverrides[login] = verdict;
+    delete kickOverrideTimes[login];
+  }
+  const notThem = new Set(Object.entries(clean).filter(([, v]) => v === "not").map(([l]) => l));
+  await chrome.storage.local.set({
+    kickOverrides,
+    kickOverrideTimes,
+    favorites: favorites.filter((l) => !notThem.has(l)), // someone you say isn't them can't stay a favorite
+  });
+  return { added, updated, unchanged, skipped };
+}

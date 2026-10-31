@@ -102,6 +102,12 @@ renderConnections();
 
 // ---------- Diagnostics ----------
 // ==== diagnostics-pure-start (no chrome.* calls in here, so it can be tested)
+// Same small function as in background.js / popup.js / content.js: keep in sync.
+function effectiveTier(v, override) {
+  if (override === "not") return "none";
+  if (override === "yes") return "confirmed";
+  return v?.tier || "unconfirmed";
+}
 const fmtDur = (ms) => {
   const m = Math.floor(ms / 60000);
   if (m < 1) return "under a minute";
@@ -196,6 +202,19 @@ function buildDiagnostics(all, total, now, quota, extra = {}) {
   if (entries.length) {
     add("Lookups", `${entries.length} channels: ${found} on Kick, ${notOn} not on Kick, ${failed} failed (~${fmtBytes(size)})`, failed ? "warn" : "");
     add("Checked", `oldest ${ago(now - oldest)}, newest ${ago(now - newest)}`);
+    const tiers = { confirmed: 0, likely: 0, unconfirmed: 0, suspected: 0, none: 0 };
+    let old = 0;
+    for (const [k, e] of entries) {
+      if (!e.value?.kickSlug) continue;
+      if (!e.value.profileTriedAt) old++;
+      tiers[effectiveTier(e.value, (all.kickOverrides || {})[k.slice(3)])]++;
+    }
+    const ovCount = Object.keys(all.kickOverrides || {}).length;
+    const bits = [`${tiers.confirmed} confirmed`, `${tiers.likely} likely`, `${tiers.unconfirmed} unconfirmed`,
+      `${tiers.suspected} possible impersonator${tiers.suspected === 1 ? "" : "s"}`];
+    if (ovCount) bits.push(`${ovCount} corrected by you`);
+    if (old) bits.push(`${old} saved by an older version (press ↻ to re-verify)`);
+    add("Matches", bits.join(", "), tiers.suspected || old ? "warn" : "");
   } else {
     add("Lookups", "Empty");
   }
@@ -298,8 +317,11 @@ function buildFavorites(s, kc, nextAt, now) {
   }
   const items = favs.map((login) => {
     const v = kc[`kc:${login}`]?.value;
+    const tier = v?.kickSlug ? effectiveTier(v, (s.kickOverrides || {})[login]) : null;
     let text = "Not checked yet", status = "";
-    if (v?.failed) { text = "Couldn't check"; status = "warn"; }
+    if (tier === "suspected") { text = "Possible impersonator (not checked, no notifications)"; status = "bad"; }
+    else if (tier === "none") { text = "Marked as not them (not checked)"; status = "warn"; }
+    else if (v?.failed) { text = "Couldn't check"; status = "warn"; }
     else if (v && !v.kickSlug) { text = "Not on Kick"; status = "warn"; }
     else if (v?.isLive) { text = "Live on Kick"; status = "ok"; }
     else if (v) { text = "Offline on Kick"; }
@@ -310,7 +332,7 @@ function buildFavorites(s, kc, nextAt, now) {
 // ==== favorites-pure-end
 
 async function renderFavorites() {
-  const s = await chrome.storage.local.get(["favorites", "followsCache", "favCheck"]);
+  const s = await chrome.storage.local.get(["favorites", "followsCache", "favCheck", "kickOverrides"]);
   const kc = await chrome.storage.local.get((s.favorites || []).map((l) => `kc:${l}`));
   const alarm = await chrome.alarms.get("kick-bridge-favs");
   const { summary, items } = buildFavorites(s, kc, alarm?.scheduledTime, Date.now());
@@ -359,7 +381,102 @@ $("checkFavs").addEventListener("click", () =>
     r.skipped ? "A check is already running." : r.checked === 0 ? "No favorites yet." : `Checked ${r.checked}.`));
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && (changes.favorites || changes.favCheck || changes.followsCache)) renderFavorites();
+  if (area === "local" && (changes.favorites || changes.favCheck || changes.followsCache || changes.kickOverrides)) renderFavorites();
 });
 setInterval(renderFavorites, 30000);
 renderFavorites();
+
+// ---------- Match corrections ----------
+// ==== overrides-pure-start (no chrome.* calls in here, so it can be tested)
+function buildOverrides(ov, followsCache) {
+  const names = new Map((followsCache?.list || []).map((f) => [f.login, f.name]));
+  return Object.entries(ov || {})
+    .map(([login, verdict]) => ({
+      login,
+      name: names.get(login) || login,
+      verdict,
+      text: verdict === "not" ? "Marked as not them (hidden)" : "Marked as it's them (confirmed)",
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+// What gets written to the export file.
+function buildExport(ov, now) {
+  return { app: "twitch-kick-bridge", version: 1, exportedAt: new Date(now).toISOString(), overrides: ov || {} };
+}
+// ==== overrides-pure-end
+
+async function renderOverrides() {
+  const s = await chrome.storage.local.get(["kickOverrides", "followsCache"]);
+  const items = buildOverrides(s.kickOverrides, s.followsCache);
+  const box = $("ovList");
+  box.textContent = "";
+  if (!items.length) {
+    const none = document.createElement("small");
+    none.textContent = "No corrections yet.";
+    box.append(none);
+    return;
+  }
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.className = "conn";
+    const left = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = it.name;
+    const state = document.createElement("small");
+    state.textContent = it.text;
+    left.append(name, document.createElement("br"), state);
+    const undo = document.createElement("button");
+    undo.className = "secondary";
+    undo.style.marginTop = "0";
+    undo.textContent = "Undo";
+    undo.addEventListener("click", () => chrome.runtime.sendMessage({ type: "SET_OVERRIDE", login: it.login, verdict: null }));
+    row.append(left, undo);
+    box.append(row);
+  }
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && (changes.kickOverrides || changes.followsCache)) renderOverrides();
+});
+renderOverrides();
+
+// ---------- Export / import of corrections ----------
+function ovMessage(text) {
+  $("ovMsg").textContent = text;
+  setTimeout(() => ($("ovMsg").textContent = ""), 6000);
+}
+
+$("exportOv").addEventListener("click", async () => {
+  const { kickOverrides = {} } = await chrome.storage.local.get("kickOverrides");
+  const n = Object.keys(kickOverrides).length;
+  if (!n) return ovMessage("Nothing to export yet.");
+  const now = Date.now();
+  const blob = new Blob([JSON.stringify(buildExport(kickOverrides, now), null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `kick-bridge-corrections-${new Date(now).toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  ovMessage(`Exported ${n} correction${n === 1 ? "" : "s"}.`);
+});
+
+$("importOv").addEventListener("click", () => $("importFile").click());
+$("importFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = ""; // so choosing the same file again still fires
+  if (!file) return;
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch (err) {
+    return ovMessage("That file isn't valid JSON.");
+  }
+  const res = await chrome.runtime.sendMessage({ type: "IMPORT_OVERRIDES", data });
+  if (res?.error) return ovMessage(`Import failed: ${res.error}`);
+  const total = res.added + res.updated + res.unchanged;
+  ovMessage(
+    `Imported ${total} correction${total === 1 ? "" : "s"} (${res.added} new, ${res.updated} changed, ${res.unchanged} already there` +
+      (res.skipped ? `, ${res.skipped} skipped as invalid` : "") + ").");
+});

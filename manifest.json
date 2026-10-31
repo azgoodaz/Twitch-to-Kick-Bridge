@@ -15,7 +15,9 @@
     "https://api.twitch.tv/*",
     "https://id.kick.com/*",
     "https://api.kick.com/*",
-    "https://kick.com/*"
+    "https://kick.com/*",
+    "https://static-cdn.jtvnw.net/*",
+    "https://files.kick.com/*"
   ],
   "background": {
     "service_worker": "background.js"

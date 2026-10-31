@@ -80,6 +80,21 @@
   <small>Hourly checks can't see a stream that starts and ends between two checks. Clicking a notification opens
     their Kick channel.</small>
 
+  <h2>Match corrections</h2>
+  <small>Kick channels are matched by username, so a few will be a different person. Matches you've marked
+    “not them” or “it's them” in the popup or on a Twitch page are listed here. Your corrections always win over
+    the automatic result, and “Clear cache” doesn't remove them.</small>
+  <div class="row" style="margin:10px 0">
+    <button id="exportOv" class="secondary">Export corrections</button>
+    <button id="importOv" class="secondary">Import corrections</button>
+    <input id="importFile" type="file" accept="application/json,.json" hidden>
+    <small id="ovMsg"></small>
+  </div>
+  <small>Export saves them to a file you can keep. Import puts them back, for example after removing and re-adding
+    the extension (or loading it from a different folder), which starts with empty storage. Imported entries win over
+    existing ones for the same streamer.</small>
+  <div id="ovList"></div>
+
   <h2>Checking speed</h2>
   <label style="font-weight:400">Check up to
     <input id="rateBatch" type="number" min="10" max="1000" style="width:70px">
