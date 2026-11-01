@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <title>Twitch → Kick Bridge</title>
   <style>
-    body { font: 14px/1.5 system-ui, sans-serif; max-width: 560px; margin: 32px auto; padding: 0 16px; color: #1f1f23; }
+    body { font: 14px/1.5 system-ui, sans-serif; max-width: 640px; margin: 32px auto; padding: 0 16px; color: #1f1f23; }
     h1 { font-size: 20px; }
     h2 { font-size: 15px; margin-top: 24px; }
     label { display: block; margin: 10px 0 4px; font-weight: 600; }
@@ -26,12 +26,28 @@
     table.diag tr.grp th { padding-top: 16px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #5c5c66; }
     .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: #a1a1aa; }
     .dot.ok { background: #16a34a; } .dot.warn { background: #f59e0b; } .dot.bad { background: #dc2626; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid #e4e4e7; margin: 16px 0 4px; }
+    .tab { margin: 0; background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 6px 6px 0 0; padding: 9px 14px; color: #5c5c66; font-weight: 600; }
+    .tab:hover { background: #f4f4f5; color: #1f1f23; }
+    .tab[aria-selected="true"] { color: #1f1f23; border-bottom-color: #53fc18; }
+    .tab:focus-visible { outline: 2px solid #2563eb; outline-offset: -2px; }
+    section[role="tabpanel"] > h2:first-child { margin-top: 14px; }
   </style>
 </head>
 <body>
   <h1>Twitch → Kick Bridge</h1>
   <small>Credentials are stored locally in this browser profile (dev/testing use).</small>
 
+  <div class="tabs" role="tablist" aria-label="Settings sections">
+    <button class="tab" role="tab" id="tab-general" data-tab="general" aria-controls="panel-general" aria-selected="true" tabindex="0">General</button>
+    <button class="tab" role="tab" id="tab-connections" data-tab="connections" aria-controls="panel-connections" aria-selected="false" tabindex="-1">Connections</button>
+    <button class="tab" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">API keys</button>
+    <button class="tab" role="tab" id="tab-favorites" data-tab="favorites" aria-controls="panel-favorites" aria-selected="false" tabindex="-1">Favorites</button>
+    <button class="tab" role="tab" id="tab-matches" data-tab="matches" aria-controls="panel-matches" aria-selected="false" tabindex="-1">Matches</button>
+    <button class="tab" role="tab" id="tab-diagnostics" data-tab="diagnostics" aria-controls="panel-diagnostics" aria-selected="false" tabindex="-1">Diagnostics</button>
+  </div>
+
+  <section role="tabpanel" id="panel-general" aria-labelledby="tab-general">
   <h2>Display</h2>
   <label style="font-weight:400"><input id="minimal" type="checkbox" style="width:auto">
     Minimal button on Twitch pages (live dot + “Kick” only)</label>
@@ -42,6 +58,16 @@
   <small>The number of followed streamers who were live on Kick at the last check. It updates when a
     check finishes (first load, or ↻ in the popup), not on its own.</small>
 
+
+  <h2>Checking speed</h2>
+  <label style="font-weight:400">Check up to
+    <input id="rateBatch" type="number" min="10" max="1000" style="width:70px">
+    streamers every
+    <input id="rateMinutes" type="number" min="1" max="60" style="width:55px"> minutes</label>
+  <small>Lower this if Kick keeps rate-limiting you (default: 200 every 3 minutes). Applies to the next check.</small>
+  </section>
+
+  <section role="tabpanel" id="panel-connections" aria-labelledby="tab-connections" hidden>
   <h2>Connections</h2>
   <small>Log in to your own accounts. Register this exact URL in <b>both</b> developer apps
     (Twitch: “OAuth Redirect URLs”, Kick: the app's redirect URL):</small>
@@ -64,44 +90,9 @@
   <p><small id="connMsg"></small></p>
   <small>Twitch is used to read who you follow. Kick's public API doesn't offer a follow action (yet),
     so the Kick login is saved for later and “Kick ↗” still opens their profile.</small>
+  </section>
 
-  <h2>Favorites</h2>
-  <small>Star up to 10 streamers in the popup. They stay at the top of the list, and their live status is
-    checked automatically every hour (and right when you star someone).</small>
-  <label style="font-weight:400"><input id="notifyFavorites" type="checkbox" style="width:auto">
-    Notify me when a favorite goes live on Kick</label>
-  <div class="row" style="margin:6px 0 10px">
-    <button id="testNotify" class="secondary">Send test notification</button>
-    <button id="checkFavs" class="secondary">Check favorites now</button>
-    <small id="favMsg"></small>
-  </div>
-  <small id="favSummary"></small>
-  <div id="favList"></div>
-  <small>Hourly checks can't see a stream that starts and ends between two checks. Clicking a notification opens
-    their Kick channel.</small>
-
-  <h2>Match corrections</h2>
-  <small>Kick channels are matched by username, so a few will be a different person. Matches you've marked
-    “not them” or “it's them” in the popup or on a Twitch page are listed here. Your corrections always win over
-    the automatic result, and “Clear cache” doesn't remove them.</small>
-  <div class="row" style="margin:10px 0">
-    <button id="exportOv" class="secondary">Export corrections</button>
-    <button id="importOv" class="secondary">Import corrections</button>
-    <input id="importFile" type="file" accept="application/json,.json" hidden>
-    <small id="ovMsg"></small>
-  </div>
-  <small>Export saves them to a file you can keep. Import puts them back, for example after removing and re-adding
-    the extension (or loading it from a different folder), which starts with empty storage. Imported entries win over
-    existing ones for the same streamer.</small>
-  <div id="ovList"></div>
-
-  <h2>Checking speed</h2>
-  <label style="font-weight:400">Check up to
-    <input id="rateBatch" type="number" min="10" max="1000" style="width:70px">
-    streamers every
-    <input id="rateMinutes" type="number" min="1" max="60" style="width:55px"> minutes</label>
-  <small>Lower this if Kick keeps rate-limiting you (default: 200 every 3 minutes). Applies to the next check.</small>
-
+  <section role="tabpanel" id="panel-keys" aria-labelledby="tab-keys" hidden>
   <h2>Kick (required)</h2>
   <small>Create an app at kick.com/settings/developer</small>
   <label for="kickId">Client ID</label>
@@ -124,7 +115,43 @@
     <button id="test">Test</button>
   </div>
   <pre id="out">—</pre>
+  </section>
 
+  <section role="tabpanel" id="panel-favorites" aria-labelledby="tab-favorites" hidden>
+  <h2>Favorites</h2>
+  <small>Star up to 10 streamers in the popup. They stay at the top of the list, and their live status is
+    checked automatically every hour (and right when you star someone).</small>
+  <label style="font-weight:400"><input id="notifyFavorites" type="checkbox" style="width:auto">
+    Notify me when a favorite goes live on Kick</label>
+  <div class="row" style="margin:6px 0 10px">
+    <button id="testNotify" class="secondary">Send test notification</button>
+    <button id="checkFavs" class="secondary">Check favorites now</button>
+    <small id="favMsg"></small>
+  </div>
+  <small id="favSummary"></small>
+  <div id="favList"></div>
+  <small>Hourly checks can't see a stream that starts and ends between two checks. Clicking a notification opens
+    their Kick channel.</small>
+  </section>
+
+  <section role="tabpanel" id="panel-matches" aria-labelledby="tab-matches" hidden>
+  <h2>Match corrections</h2>
+  <small>Kick channels are matched by username, so a few will be a different person. Matches you've marked
+    “not them” or “it's them” in the popup or on a Twitch page are listed here. Your corrections always win over
+    the automatic result, and “Clear cache” doesn't remove them.</small>
+  <div class="row" style="margin:10px 0">
+    <button id="exportOv" class="secondary">Export corrections</button>
+    <button id="importOv" class="secondary">Import corrections</button>
+    <input id="importFile" type="file" accept="application/json,.json" hidden>
+    <small id="ovMsg"></small>
+  </div>
+  <small>Export saves them to a file you can keep. Import puts them back, for example after removing and re-adding
+    the extension (or loading it from a different folder), which starts with empty storage. Imported entries win over
+    existing ones for the same streamer.</small>
+  <div id="ovList"></div>
+  </section>
+
+  <section role="tabpanel" id="panel-diagnostics" aria-labelledby="tab-diagnostics" hidden>
   <h2>Diagnostics</h2>
   <small>What the extension knows about itself. No tokens or secrets are shown or copied.</small>
   <table class="diag" id="diag"></table>
@@ -135,6 +162,7 @@
   </div>
   <small>Clear cache removes saved lookups, the follow list, cached app tokens, error history and any running check.
     Your logins, credentials and settings stay.</small>
+  </section>
 
   <script src="options.js"></script>
 </body>

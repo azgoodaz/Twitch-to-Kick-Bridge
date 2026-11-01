@@ -239,6 +239,7 @@ function diagnosticsText(rows, version, now) {
 let lastDiagRows = [];
 
 async function renderDiagnostics() {
+  if (document.getElementById("panel-diagnostics").hidden) return; // heavy: only while you're looking at it
   const all = await chrome.storage.local.get(null);
   const total = await chrome.storage.local.getBytesInUse(null);
   const quota = chrome.storage.local.QUOTA_BYTES || 10485760;
@@ -480,3 +481,39 @@ $("importFile").addEventListener("change", async (e) => {
     `Imported ${total} correction${total === 1 ? "" : "s"} (${res.added} new, ${res.updated} changed, ${res.unchanged} already there` +
       (res.skipped ? `, ${res.skipped} skipped as invalid` : "") + ").");
 });
+
+// ---------- Tabs ----------
+// ==== tabs-start
+const TABS = [...document.querySelectorAll('[role="tab"]')];
+
+function selectTab(name, { focus = false, updateHash = true } = {}) {
+  const tab = TABS.find((t) => t.dataset.tab === name) || TABS[0];
+  for (const t of TABS) {
+    const on = t === tab;
+    t.setAttribute("aria-selected", String(on));
+    t.tabIndex = on ? 0 : -1;
+    document.getElementById(`panel-${t.dataset.tab}`).hidden = !on;
+  }
+  if (focus) tab.focus();
+  if (updateHash) history.replaceState(null, "", `#${tab.dataset.tab}`); // refresh keeps your place; the URL can be bookmarked
+  if (tab.dataset.tab === "diagnostics") renderDiagnostics();
+}
+
+TABS.forEach((t, i) => {
+  t.addEventListener("click", () => selectTab(t.dataset.tab));
+  t.addEventListener("keydown", (e) => {
+    const next = { ArrowRight: (i + 1) % TABS.length, ArrowLeft: (i - 1 + TABS.length) % TABS.length, Home: 0, End: TABS.length - 1 }[e.key];
+    if (next === undefined) return;
+    e.preventDefault();
+    selectTab(TABS[next].dataset.tab, { focus: true });
+  });
+});
+window.addEventListener("hashchange", () => selectTab(location.hash.slice(1), { updateHash: false }));
+// ==== tabs-end
+
+if (location.hash.slice(1)) {
+  selectTab(location.hash.slice(1));
+} else {
+  // first run: start where setup happens
+  chrome.storage.local.get(["kickId", "kickSecret"]).then((s) => selectTab(s.kickId && s.kickSecret ? "general" : "keys", { updateHash: false }));
+}

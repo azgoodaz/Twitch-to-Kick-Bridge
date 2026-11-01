@@ -138,10 +138,10 @@ function ensureButton() {
       v.textContent = "✓";
       a.append(v);
     }
-    if (tier === "likely" || tier === "unconfirmed") {
+    if (tier === "unconfirmed") { // only a caution gets a label; the tooltip has the details
       const q = document.createElement("span");
       q.className = "muted";
-      q.textContent = tier === "likely" ? "(likely)" : "(unconfirmed)";
+      q.textContent = "(unconfirmed)";
       a.append(q);
     }
     // Corrections, only where a human judgement can help (or to undo one).

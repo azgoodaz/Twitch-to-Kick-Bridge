@@ -280,12 +280,9 @@ function subText(res, tier, ov, recent) {
     // You vouched for it: no confidence label at all, just the clean status line.
     // (A brief "you confirmed this match" shows right after the click, alongside Undo.)
     if (recent) parts.push("you confirmed this match");
-  } else {
-    parts.push(
-      tier === "confirmed" ? "confirmed match"
-        : tier === "likely" ? "likely match"
-        : "unconfirmed (same username)"
-    );
+  } else if (tier === "unconfirmed") {
+    // Only a caution gets a label: no label means confirmed or likely (hover the status for the reasons).
+    parts.push("unconfirmed (same username)");
   }
   return parts.join(" · ");
 }
