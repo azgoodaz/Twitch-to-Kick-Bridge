@@ -15,7 +15,7 @@ const HANDLERS = {
   CLEAR_CACHE: () => clearCache(),               // settings > Diagnostics
   CHECK_FAVORITES: () => checkFavorites(),       // settings > Favorites: "Check now"
   SET_OVERRIDE: (m) => setOverride(m.login, m.verdict), // "not them" / "it's them" / undo
-  IMPORT_OVERRIDES: (m) => importOverrides(m.data),     // settings: restore corrections from an export file
+  IMPORT_BACKUP: (m) => importBackup(m.data, { dryRun: Boolean(m.dryRun) }), // settings > Backup (dryRun = preview only)
   TEST_NOTIFICATION: () => testNotification(),   // settings > Favorites
   LOG_ERROR: (m) => recordError(m.source, m.message).then(() => ({ ok: true })), // popup -> diagnostics
 };
@@ -466,6 +466,7 @@ async function refreshLive(entries) {
 let activeScan = false;
 let scanCancelled = false; // set by "Clear cache" to stop a running scan
 const WATCHDOG = "kick-bridge-scan";
+const MAX_RATE_STRIKES = 12; // consecutive rate limits before giving up: about an hour and a half of patience
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
@@ -526,16 +527,42 @@ async function runQueue() {
     const total = s.scanTotal || items.length + live.length;
     const liveCount = total - items.length;
 
-    // Pace: `batch` checks spread evenly over `minutes`.
-    const batch = clamp(Math.round(Number(s.rateBatch) || 200), 10, 1000);
-    const minutes = clamp(Number(s.rateMinutes) || 3, 1, 60);
-    const base = (minutes * 60_000) / batch;
-    let interval = base;
+    // Pace: `batch` checks spread evenly over `minutes` (200 per 5 min = one every 1.5 s), so a long
+    // list is worked through in successive batches of that size until every streamer is done.
+    const paceOf = (r) => {
+      const batch = clamp(Math.round(Number(r.rateBatch) || 200), 10, 1000);
+      const minutes = clamp(Math.round(Number(r.rateMinutes) || 3), 1, 60);
+      return { batch, minutes, base: (minutes * 60_000) / batch };
+    };
+    let pace = paceOf(s);
+    let interval = pace.base;
+    st.batch = pace.batch;
+    st.minutes = pace.minutes;
 
     const twInfo = new Map((s.followsCache?.list || []).map((f) => [f.login, { bio: f.bio, img: f.img, type: f.type }]));
 
     st.total = total;
     st.done = (live.length ? 0 : liveCount) + index;
+
+    // Where we are, for the countdown in Settings: which batch, how far into it, and when it (and
+    // everything) should be finished at the current pace. Recomputed after every streamer.
+    const progress = () => {
+      const left = items.length - index;
+      const size = pace.batch;
+      const pos = index % size;
+      const len = Math.min(size, items.length - (index - pos));
+      const now = Date.now();
+      return {
+        index, count: items.length, interval,
+        batchNo: Math.min(Math.ceil(items.length / size) || 1, Math.floor(index / size) + 1),
+        batchCount: Math.ceil(items.length / size) || 1,
+        batchPos: pos, batchLen: len,
+        batchEndsAt: now + Math.min(len - pos, left) * interval,
+        finishesAt: now + left * interval,
+        etaMs: left * interval,
+      };
+    };
+    Object.assign(st, progress());
     await saveState();
 
     // 1) live status of everyone already known to be on Kick: one batched request per 50
@@ -555,6 +582,17 @@ async function runQueue() {
     // 2) full lookups, one at a time at the steady pace
     let strikes = 0, backoff = 60_000;
     while (index < items.length && !scanCancelled) {
+      // Changed the speed in Settings while this runs? Pick it up (checked every 10 streamers).
+      if (index % 10 === 0) {
+        const next = paceOf(await chrome.storage.local.get(["rateBatch", "rateMinutes"]));
+        if (next.base !== pace.base) {
+          pace = next;
+          interval = pace.base;
+          st.batch = pace.batch;
+          st.minutes = pace.minutes;
+          Object.assign(st, progress());
+        }
+      }
       const it = items[index];
       const t0 = Date.now();
       try {
@@ -562,20 +600,24 @@ async function runQueue() {
         strikes = 0;
         backoff = 60_000;
       } catch (e) {
-        if (!isRateLimit(e)) throw e;
-        await noteRateLimit(e);
-        if (++strikes > 6) { st.limited = true; break; } // give up; leftovers wait for ↻
-        const wait = e.retryAfterMs || backoff;
-        backoff = Math.min(backoff * 2, 10 * 60_000);
-        interval = Math.min(interval * 1.5, base * 4);   // be gentler for the rest of the scan
-        await saveState({ pausedUntil: Date.now() + wait });
-        await sleepAlive(wait, () => saveState());
-        await saveState({ pausedUntil: 0 });
-        continue; // retry the same streamer
+        if (!isRateLimit(e)) {
+          // One streamer that can't be checked must not stop the other hundreds: note it and move on.
+          await recordError("Scan", e);
+        } else {
+          await noteRateLimit(e);
+          if (++strikes > MAX_RATE_STRIKES) { st.limited = true; break; } // truly stuck: stop; leftovers wait for ↻
+          const wait = e.retryAfterMs || backoff;
+          backoff = Math.min(backoff * 2, 10 * 60_000);
+          interval = Math.min(interval * 1.5, pace.base * 4); // be gentler for the rest of the scan
+          await saveState({ pausedUntil: Date.now() + wait });
+          await sleepAlive(wait, () => saveState());
+          await saveState({ pausedUntil: 0 });
+          continue; // wait it out, then retry the same streamer: the queue is never abandoned
+        }
       }
       index++;
       st.done = liveCount + index;
-      st.etaMs = (items.length - index) * interval;
+      Object.assign(st, progress());
       if (index % 10 === 0) await chrome.storage.local.set({ scanIndex: index });
       await saveState();
 
@@ -594,6 +636,20 @@ async function runQueue() {
   await saveState({ running: false, pausedUntil: 0, etaMs: 0, finishedAt: Date.now() });
   activeScan = false;
 }
+
+// A scan that was interrupted (worker stopped, browser closed) carries on from where it was, at once
+// when the worker next starts, with the alarm below as the backstop. The queue is only dropped when it's
+// finished, cancelled by "Clear cache", or Kick has refused us for far too long.
+async function resumeScanIfPending() {
+  if (activeScan) return;
+  const s = await chrome.storage.local.get(["scanItems", "scanIndex", "scanLive"]);
+  const pending = s.scanItems && ((s.scanIndex || 0) < s.scanItems.length || (s.scanLive || []).length);
+  if (!pending) return;
+  chrome.alarms.create(WATCHDOG, { periodInMinutes: 1 });
+  runQueue();
+}
+chrome.runtime.onStartup.addListener(resumeScanIfPending);
+resumeScanIfPending(); // also whenever the worker wakes up
 
 // If Chrome stopped this worker mid-scan, pick the queue back up.
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -761,7 +817,7 @@ async function twitchLogout() {
     } catch (e) { /* still forget it locally */ }
   }
   // The follow list belongs to the logged-in account, so it goes too.
-  await chrome.storage.local.remove(["twitchUser", "followsCache"]);
+  await chrome.storage.local.remove(["twitchUser", "followsCache", "followCount"]);
   return { ok: true };
 }
 
@@ -795,7 +851,7 @@ async function noteRateLimit(err) {
 
 // Everything here can be re-fetched. Logins, credentials and settings are kept.
 const CACHE_KEYS = [
-  "followsCache", "scanState", "scanItems", "scanIndex", "scanLive", "scanTotal",
+  "followsCache", "followCount", "scanState", "scanItems", "scanIndex", "scanLive", "scanTotal",
   "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck",
 ];
 
@@ -968,49 +1024,103 @@ async function setOverride(login, verdict) {
   return { ok: true };
 }
 
-// Restore corrections from a file made by Settings > Match corrections > Export.
-// Validated strictly (it's a file from outside): known app + version, sane logins, only
-// "yes"/"not". Imported entries win over existing ones for the same streamer. Imported
-// confirmations are settled, so they get no Undo window.
+// Restore a backup made by Settings > Backup > Export. Three parts, all optional in the file:
+//   corrections  merged into yours; the file wins for the same streamer
+//   favorites    REPLACE your current list (it's a restore, and the cap of 10 still applies)
+//   settings     only the known display/speed/notification settings, each type- and range-checked
+// Never touched: API keys and secrets, logins, caches. The file is untrusted input, so it is
+// validated strictly (app + version, sane logins, known setting names and values).
+// With { dryRun: true } nothing is written: you get the same counts, to preview before restoring.
 const LOGIN_RE = /^[a-z0-9_]{1,25}$/;
-const own = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key); // `in` would also match "constructor", "toString"...
 const MAX_IMPORT = 5000;
+const own = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key); // `in` would also match "constructor", "toString"...
+const BACKUP_SETTINGS = {
+  minimal: { type: "bool" }, showBadge: { type: "bool" }, notifyFavorites: { type: "bool" }, liveOnly: { type: "bool" },
+  rateBatch: { type: "int", min: 10, max: 1000 }, rateMinutes: { type: "int", min: 1, max: 60 },
+};
+const validLogin = (login) => LOGIN_RE.test(login) && login !== "__proto__"; // "__proto__" can't be stored as a key
 
-async function importOverrides(data) {
-  if (!data || typeof data !== "object" || data.app !== "twitch-kick-bridge") {
-    throw new Error("This file isn't a Twitch → Kick Bridge export.");
-  }
-  if (!(Number(data.version) >= 1)) throw new Error("This file isn't a Twitch → Kick Bridge export.");
-  if (Number(data.version) > 1) throw new Error("This export was made by a newer version of the extension.");
+async function importBackup(data, { dryRun = false } = {}) {
+  const notOurs = "This file isn't a Twitch → Kick Bridge export.";
+  if (!data || typeof data !== "object" || data.app !== "twitch-kick-bridge") throw new Error(notOurs);
+  const version = Number(data.version);
+  if (!(version >= 1)) throw new Error(notOurs);
+  if (version > 2) throw new Error("This export was made by a newer version of the extension.");
+
   const src = data.overrides;
-  if (!src || typeof src !== "object" || Array.isArray(src)) throw new Error("This export has no corrections in it.");
-  const entries = Object.entries(src);
+  const hasCorrections = src !== undefined;
+  if (version === 1 || hasCorrections) {
+    if (!src || typeof src !== "object" || Array.isArray(src)) throw new Error("This export has no corrections in it.");
+  } else if (data.favorites === undefined && data.settings === undefined) {
+    throw new Error("This backup has nothing in it.");
+  }
+  const entries = hasCorrections ? Object.entries(src) : [];
   if (entries.length > MAX_IMPORT) throw new Error(`Too many entries (the limit is ${MAX_IMPORT}).`);
 
+  const out = {
+    added: 0, updated: 0, unchanged: 0, skipped: 0,         // corrections
+    favoritesRestored: null, favoritesSkipped: 0,           // null = not in the file
+    settingsRestored: null, settingsSkipped: 0,
+    warnings: [],
+  };
+
+  // ---- corrections
   const clean = {};
-  let skipped = 0;
   for (const [raw, verdict] of entries) {
     const login = String(raw).trim().toLowerCase();
-    // "__proto__" is a valid-looking login but can't be stored as a key; skip it rather than lose it silently
-    if (LOGIN_RE.test(login) && login !== "__proto__" && (verdict === "yes" || verdict === "not")) clean[login] = verdict;
-    else skipped++;
+    if (validLogin(login) && (verdict === "yes" || verdict === "not")) clean[login] = verdict;
+    else out.skipped++;
   }
-
   const { kickOverrides = {}, kickOverrideTimes = {}, favorites = [] } =
     await chrome.storage.local.get(["kickOverrides", "kickOverrideTimes", "favorites"]);
-  let added = 0, updated = 0, unchanged = 0;
   for (const [login, verdict] of Object.entries(clean)) {
-    if (!own(kickOverrides, login)) added++;
-    else if (kickOverrides[login] !== verdict) updated++;
-    else unchanged++;
+    if (!own(kickOverrides, login)) out.added++;
+    else if (kickOverrides[login] !== verdict) out.updated++;
+    else out.unchanged++;
     kickOverrides[login] = verdict;
-    delete kickOverrideTimes[login];
+    delete kickOverrideTimes[login]; // imported confirmations are settled: no Undo window
   }
-  const notThem = new Set(Object.entries(clean).filter(([, v]) => v === "not").map(([l]) => l));
-  await chrome.storage.local.set({
-    kickOverrides,
-    kickOverrideTimes,
-    favorites: favorites.filter((l) => !notThem.has(l)), // someone you say isn't them can't stay a favorite
-  });
-  return { added, updated, unchanged, skipped };
+  const update = {};
+  if (hasCorrections) {
+    update.kickOverrides = kickOverrides;
+    update.kickOverrideTimes = kickOverrideTimes;
+  }
+
+  // ---- favorites (replace), never including anyone you've said isn't them
+  let nextFavorites = favorites.filter((l) => !(own(kickOverrides, l) && kickOverrides[l] === "not" && clean[l] === "not"));
+  if (data.favorites !== undefined) {
+    if (!Array.isArray(data.favorites)) {
+      out.warnings.push("The favorites in this file aren't a list, so they were ignored.");
+    } else {
+      const list = [];
+      for (const raw of data.favorites) {
+        const login = String(raw).trim().toLowerCase();
+        if (!validLogin(login) || list.includes(login) || (own(kickOverrides, login) && kickOverrides[login] === "not") || list.length >= MAX_FAVS) out.favoritesSkipped++;
+        else list.push(login);
+      }
+      nextFavorites = list;
+      out.favoritesRestored = list.length;
+    }
+  }
+  if (hasCorrections || out.favoritesRestored !== null) update.favorites = nextFavorites;
+
+  // ---- settings (whitelist, typed and range-checked)
+  if (data.settings !== undefined) {
+    if (!data.settings || typeof data.settings !== "object" || Array.isArray(data.settings)) {
+      out.warnings.push("The settings in this file aren't valid, so they were ignored.");
+    } else {
+      let applied = 0;
+      for (const [key, value] of Object.entries(data.settings)) {
+        const rule = own(BACKUP_SETTINGS, key) ? BACKUP_SETTINGS[key] : null;
+        const ok = rule && (rule.type === "bool"
+          ? typeof value === "boolean"
+          : Number.isInteger(value) && value >= rule.min && value <= rule.max);
+        if (ok) { update[key] = value; applied++; } else out.settingsSkipped++;
+      }
+      out.settingsRestored = applied;
+    }
+  }
+
+  if (!dryRun) await chrome.storage.local.set(update);
+  return out;
 }

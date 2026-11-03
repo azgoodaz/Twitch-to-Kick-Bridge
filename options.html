@@ -32,6 +32,11 @@
     .tab[aria-selected="true"] { color: #1f1f23; border-bottom-color: #53fc18; }
     .tab:focus-visible { outline: 2px solid #2563eb; outline-offset: -2px; }
     section[role="tabpanel"] > h2:first-child { margin-top: 14px; }
+    .next { margin: 10px 0 4px; padding: 12px 14px; border: 1px solid #e4e4e7; border-radius: 8px; }
+    .next-head { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .next.warn .next-head { color: #b45309; }
+    .bar { height: 6px; border-radius: 3px; background: #e4e4e7; margin: 8px 0; overflow: hidden; }
+    .bar > div { height: 100%; width: 0; background: #53fc18; transition: width .6s ease; }
   </style>
 </head>
 <body>
@@ -44,6 +49,7 @@
     <button class="tab" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">API keys</button>
     <button class="tab" role="tab" id="tab-favorites" data-tab="favorites" aria-controls="panel-favorites" aria-selected="false" tabindex="-1">Favorites</button>
     <button class="tab" role="tab" id="tab-matches" data-tab="matches" aria-controls="panel-matches" aria-selected="false" tabindex="-1">Matches</button>
+    <button class="tab" role="tab" id="tab-backup" data-tab="backup" aria-controls="panel-backup" aria-selected="false" tabindex="-1">Backup</button>
     <button class="tab" role="tab" id="tab-diagnostics" data-tab="diagnostics" aria-controls="panel-diagnostics" aria-selected="false" tabindex="-1">Diagnostics</button>
   </div>
 
@@ -64,7 +70,15 @@
     <input id="rateBatch" type="number" min="10" max="1000" style="width:70px">
     streamers every
     <input id="rateMinutes" type="number" min="1" max="60" style="width:55px"> minutes</label>
-  <small>Lower this if Kick keeps rate-limiting you (default: 200 every 3 minutes). Applies to the next check.</small>
+  <small>Lower this if Kick keeps rate-limiting you (default: 200 every 3 minutes). A check that's already running
+    picks up a change within a few streamers.</small>
+  <p><small id="speedEstimate"></small></p>
+
+  <div class="next" id="nextBox" aria-live="polite">
+    <div class="next-head" id="nextHeadline"></div>
+    <div class="bar" id="nextBar" hidden><div id="nextFill"></div></div>
+    <small id="nextSub"></small>
+  </div>
   </section>
 
   <section role="tabpanel" id="panel-connections" aria-labelledby="tab-connections" hidden>
@@ -135,20 +149,36 @@
   </section>
 
   <section role="tabpanel" id="panel-matches" aria-labelledby="tab-matches" hidden>
+  <h2>Match overview</h2>
+  <table class="diag" id="matchSummary"></table>
+  <p><small>Possible impersonators appear in the popup with a ⚠ warning, below your other matches. Use “Not them” or
+    “It's them” on a row to correct one we got wrong.</small></p>
+
   <h2>Match corrections</h2>
   <small>Kick channels are matched by username, so a few will be a different person. Matches you've marked
     “not them” or “it's them” in the popup or on a Twitch page are listed here. Your corrections always win over
     the automatic result, and “Clear cache” doesn't remove them.</small>
-  <div class="row" style="margin:10px 0">
-    <button id="exportOv" class="secondary">Export corrections</button>
-    <button id="importOv" class="secondary">Import corrections</button>
-    <input id="importFile" type="file" accept="application/json,.json" hidden>
-    <small id="ovMsg"></small>
-  </div>
-  <small>Export saves them to a file you can keep. Import puts them back, for example after removing and re-adding
-    the extension (or loading it from a different folder), which starts with empty storage. Imported entries win over
-    existing ones for the same streamer.</small>
+  <p><small>To back these up (together with your favorites and settings), use the <b>Backup</b> tab.</small></p>
   <div id="ovList"></div>
+  </section>
+
+  <section role="tabpanel" id="panel-backup" aria-labelledby="tab-backup" hidden>
+  <h2>Backup</h2>
+  <small>Save your match corrections, favorites and settings to a file, and restore them later: after removing and
+    re-adding the extension, loading it from a different folder, or on another computer (each of those starts with empty
+    storage). “Clear cache” doesn't remove any of this.</small>
+  <p><small id="backupSummary"></small></p>
+  <div class="row" style="margin:10px 0">
+    <button id="exportBackup" class="secondary">Export backup</button>
+    <button id="importBackup" class="secondary">Import backup</button>
+    <input id="importFile" type="file" accept="application/json,.json" hidden>
+    <small id="backupMsg"></small>
+  </div>
+  <p><small><b>Included:</b> match corrections, favorites, and your display, checking-speed and notification settings.<br>
+    <b>Not included:</b> API keys and secrets (a backup file is easy to share by accident), your Twitch and Kick logins
+    (just log in again), and cached lookups (the popup re-checks your follows the first time, as on a new install).</small></p>
+  <small>When you import, you'll see what will change first. Corrections are merged with yours (the file wins for the same
+    streamer). Favorites and settings in the file replace your current ones. Older corrections-only exports still work.</small>
   </section>
 
   <section role="tabpanel" id="panel-diagnostics" aria-labelledby="tab-diagnostics" hidden>

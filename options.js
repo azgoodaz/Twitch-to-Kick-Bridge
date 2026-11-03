@@ -32,17 +32,109 @@ $("redirect").textContent = chrome.identity.getRedirectURL();
 chrome.storage.local.get("minimal").then((s) => ($("minimal").checked = Boolean(s.minimal)));
 $("minimal").addEventListener("change", (e) => chrome.storage.local.set({ minimal: e.target.checked }));
 
-// Checking speed: saved as you type, read at the start of each check.
+// ==== speed-pure-start (no chrome.* calls in here, so it can be tested)
+const clampN = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+const RATE_LIMITS = { rateBatch: [10, 1000], rateMinutes: [1, 60] };
+const RATE_DEFAULTS = { rateBatch: 200, rateMinutes: 3 };
+
+// What a speed setting means for your list, in plain words.
+function speedEstimate(follows, batch, minutes) {
+  const every = (minutes * 60) / batch; // seconds between checks
+  const everyText = every < 60 ? `${Number(every.toFixed(1))} s` : `${Math.round(every / 60)} min`;
+  if (!follows) return `One check every ${everyText}: ${batch} streamers every ${minutes} min. A long list is worked through batch by batch until every streamer is checked.`;
+  const batches = Math.ceil(follows / batch);
+  const totalMin = Math.max(1, Math.round((follows * every) / 60));
+  const dur = totalMin >= 120 ? `${Math.floor(totalMin / 60)} h ${totalMin % 60} min` : `${totalMin} min`;
+  return `Checking all ${follows} of your follows takes about ${dur}: ${batches} batch${batches === 1 ? "" : "es"} of ${batch}, ` +
+    `one check every ${everyText}. It carries on by itself until every streamer is checked, even if you close the popup ` +
+    `or restart Chrome, and it waits out any Kick rate limit.`;
+}
+// ==== speed-pure-end
+
+// ==== next-pure-start (no chrome.* calls in here, so it can be tested; uses fmtDur/ago/clampN from above)
+// m:ss, or h:mm:ss from an hour up.
+function clock(ms) {
+  const t = Math.max(0, Math.ceil(ms / 1000));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+// What to show under "Checking speed": a live countdown to the next batch while a check runs, or to the next
+// automatic refresh (your favorites' hourly check) when nothing is running.
+function nextRefreshView({ scan, favorites, favNextAt, now }) {
+  const ss = scan || {};
+  const alive = ss.running && now - (ss.heartbeat || 0) < 20_000;
+  if (alive) {
+    const batches = ss.batchCount > 1 ? `batch ${ss.batchNo} of ${ss.batchCount}` : "";
+    const fraction = ss.batchLen ? clampN((ss.batchPos || 0) / ss.batchLen, 0, 1) : null;
+    const left = (ss.finishesAt || 0) - now;
+    const allDone = ss.finishesAt ? `all done in ${left < 60_000 ? "under a minute" : `about ${fmtDur(left)}`}` : "";
+    const where = [ss.done !== undefined ? `${ss.done} of ${ss.total}` : "", batches, allDone].filter(Boolean);
+    if (ss.pausedUntil > now) {
+      return { tone: "warn", fraction, headline: `Paused by Kick: resuming in ${clock(ss.pausedUntil - now)}`,
+        sub: `Kick asked us to slow down. Then it carries on${batches ? ` with ${batches}` : ""}.` };
+    }
+    if (!ss.batchEndsAt) { // a check started by an older version: no batch details
+      return { tone: "", fraction: null, headline: `Checking: about ${fmtDur(ss.etaMs || 0)} left`, sub: where.join(" · ") };
+    }
+    const lastBatch = !(ss.batchCount > 1) || ss.batchNo >= ss.batchCount;
+    return {
+      tone: "", fraction,
+      headline: lastBatch ? `${ss.batchCount > 1 ? "Last batch: finishes" : "Finishes"} in ${clock(ss.batchEndsAt - now)}` : `Next batch in ${clock(ss.batchEndsAt - now)}`,
+      sub: `Checking now: ${where.join(" · ")}`,
+    };
+  }
+  const last = ss.finishedAt ? `Last check finished ${ago(now - ss.finishedAt)}. ` : "";
+  if ((favorites || []).length && favNextAt && favNextAt > now) {
+    return { tone: "", fraction: null, headline: `Next automatic refresh in ${clock(favNextAt - now)}`,
+      sub: `${last}That's your favorites' hourly check. Everything else refreshes when you press ↻ in the popup.` };
+  }
+  return { tone: "", fraction: null, headline: "No refresh scheduled",
+    sub: `${last}Press ↻ in the popup to check your follows. Favorites are checked every hour once you star someone.` };
+}
+// ==== next-pure-end
+
+async function renderNextRefresh() {
+  if (document.getElementById("panel-general").hidden) return; // only while you're looking at it
+  const s = await chrome.storage.local.get(["scanState", "favorites"]);
+  const alarm = await chrome.alarms.get("kick-bridge-favs");
+  const v = nextRefreshView({ scan: s.scanState, favorites: s.favorites, favNextAt: alarm?.scheduledTime, now: Date.now() });
+  $("nextHeadline").textContent = v.headline;
+  $("nextSub").textContent = v.sub;
+  $("nextBox").classList.toggle("warn", v.tone === "warn");
+  $("nextBar").hidden = v.fraction === null;
+  if (v.fraction !== null) $("nextFill").style.width = `${Math.round(v.fraction * 100)}%`;
+}
+setInterval(renderNextRefresh, 1000); // the countdown
+renderNextRefresh();
+
+// Checking speed: saved as you type (kept inside the allowed range), picked up by the running check.
+async function renderSpeedEstimate() {
+  const { followsCache } = await chrome.storage.local.get("followsCache");
+  const batch = clampN(Math.round(Number($("rateBatch").value) || RATE_DEFAULTS.rateBatch), ...RATE_LIMITS.rateBatch);
+  const minutes = clampN(Math.round(Number($("rateMinutes").value) || RATE_DEFAULTS.rateMinutes), ...RATE_LIMITS.rateMinutes);
+  $("speedEstimate").textContent = speedEstimate(followsCache?.list?.length || 0, batch, minutes);
+}
 chrome.storage.local.get(["rateBatch", "rateMinutes"]).then((s) => {
-  $("rateBatch").value = s.rateBatch || 200;
-  $("rateMinutes").value = s.rateMinutes || 3;
+  $("rateBatch").value = s.rateBatch || RATE_DEFAULTS.rateBatch;
+  $("rateMinutes").value = s.rateMinutes || RATE_DEFAULTS.rateMinutes;
+  renderSpeedEstimate();
 });
 for (const id of ["rateBatch", "rateMinutes"]) {
+  $(id).addEventListener("input", renderSpeedEstimate); // the estimate follows as you type
   $(id).addEventListener("change", (e) => {
     const n = Number(e.target.value);
-    if (n > 0) chrome.storage.local.set({ [id]: n });
+    const [lo, hi] = RATE_LIMITS[id];
+    const v = clampN(Math.round(n > 0 ? n : RATE_DEFAULTS[id]), lo, hi); // empty/invalid -> default, out of range -> nearest allowed
+    e.target.value = v;
+    chrome.storage.local.set({ [id]: v });
+    renderSpeedEstimate();
   });
 }
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.followsCache) renderSpeedEstimate();
+});
 
 // Toolbar badge: saved immediately; the background worker reacts to the change.
 chrome.storage.local.get("showBadge").then((s) => ($("showBadge").checked = Boolean(s.showBadge)));
@@ -170,7 +262,12 @@ function buildDiagnostics(all, total, now, quota, extra = {}) {
   }
   add("Pace", `${batch} streamers every ${minutes} min (one every ${((minutes * 60) / batch).toFixed(1)}s)`);
   const left = (all.scanItems || []).length - (all.scanIndex || 0);
-  if (alive) add("Check", `Running: ${ss.done}/${ss.total}`, "ok");
+  if (alive) {
+    const size = ss.batch || batch;
+    const n = Math.ceil(ss.total / size);
+    const cur = Math.min(n, Math.floor(ss.done / size) + 1);
+    add("Check", `Running: ${ss.done}/${ss.total}${n > 1 ? ` · batch ${cur} of ${n}` : ""}`, "ok");
+  }
   else if (all.scanItems && left > 0) add("Check", `Interrupted with ${left} left. It resumes automatically`, "warn");
   else if (ss.finishedAt) add("Check", `Idle. Last finished ${ago(now - ss.finishedAt)}`, "ok");
   else add("Check", "Nothing checked yet");
@@ -219,7 +316,11 @@ function buildDiagnostics(all, total, now, quota, extra = {}) {
     add("Lookups", "Empty");
   }
   const fc = all.followsCache;
-  add("Follow list", fc ? `${fc.list.length} follows, saved ${ago(now - fc.at)} (~${fmtBytes(bytesOf(fc))})` : "Not loaded yet");
+  const fcount = all.followCount;
+  add("Follow list", fc
+    ? `${fc.list.length} follows${typeof fcount === "number" && fcount !== fc.list.length ? ` (Twitch counts ${fcount}; the difference has no profile, e.g. deleted or banned)` : ""}, saved ${ago(now - fc.at)} (~${fmtBytes(bytesOf(fc))})`
+    : "Not loaded yet");
+  if (typeof fcount === "number") add("Follow count", `${fcount}. The refresh button compares Twitch's current number with this one`);
   add("Storage", `${fmtBytes(total)} used of ${fmtBytes(quota)}`, total > quota * 0.8 ? "warn" : "");
 
   group("Recent errors");
@@ -400,11 +501,62 @@ function buildOverrides(ov, followsCache) {
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
-// What gets written to the export file.
-function buildExport(ov, now) {
-  return { app: "twitch-kick-bridge", version: 1, exportedAt: new Date(now).toISOString(), overrides: ov || {} };
+// Counts for the Matches tab. Same rules as the popup's header: only streamers you currently follow,
+// your own corrections applied, lookalikes and "not them" kept out of "on Kick".
+function buildMatchSummary(s, kc) {
+  const ov = s.kickOverrides || {};
+  const follows = s.followsCache?.list;
+  const logins = follows ? follows.map((f) => f.login) : Object.keys(kc).filter((k) => k.startsWith("kc:")).map((k) => k.slice(3));
+  const m = { confirmed: 0, likely: 0, unconfirmed: 0, suspected: 0, hidden: 0, reverify: 0 };
+  for (const login of logins) {
+    const v = kc[`kc:${login}`]?.value;
+    if (!v?.kickSlug) continue;
+    if (!v.profileTriedAt) m.reverify++;
+    const t = effectiveTier(v, ov[login]);
+    if (t === "none") m.hidden++;
+    else m[t]++;
+  }
+  m.onKick = m.confirmed + m.likely + m.unconfirmed;
+  return m;
+}
+
+function matchSummaryRows(m) {
+  const rows = [{
+    label: "On Kick",
+    text: m.onKick ? `${m.onKick} (${m.confirmed} confirmed, ${m.likely} likely, ${m.unconfirmed} unconfirmed)` : "0",
+    status: m.onKick ? "ok" : "",
+  }];
+  rows.push({ label: "⚠ Possible impersonators", text: m.suspected ? String(m.suspected) : "None", status: m.suspected ? "warn" : "ok" });
+  if (m.hidden) rows.push({ label: "Marked “not them”", text: String(m.hidden), status: "" });
+  if (m.reverify) rows.push({ label: "To re-verify", text: `${m.reverify} saved by an older version. Press ↻ in the popup`, status: "warn" });
+  return rows;
 }
 // ==== overrides-pure-end
+
+async function renderMatchSummary() {
+  if (document.getElementById("panel-matches").hidden) return; // only while you're looking at it
+  const all = await chrome.storage.local.get(null);
+  const table = $("matchSummary");
+  table.textContent = "";
+  for (const r of matchSummaryRows(buildMatchSummary(all, all))) {
+    const tr = document.createElement("tr");
+    const th = document.createElement("th");
+    th.textContent = r.label;
+    const td = document.createElement("td");
+    const dot = document.createElement("span");
+    dot.className = `dot ${r.status}`;
+    td.append(dot, document.createTextNode(r.text));
+    tr.append(th, td);
+    table.append(tr);
+  }
+}
+let matchTimer = null;
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (!Object.keys(changes).some((k) => k.startsWith("kc:") || k === "kickOverrides" || k === "followsCache")) return;
+  clearTimeout(matchTimer);
+  matchTimer = setTimeout(renderMatchSummary, 1000); // a check writes many entries: wait for a quiet moment
+});
 
 async function renderOverrides() {
   const s = await chrome.storage.local.get(["kickOverrides", "followsCache"]);
@@ -440,30 +592,100 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 renderOverrides();
 
-// ---------- Export / import of corrections ----------
-function ovMessage(text) {
-  $("ovMsg").textContent = text;
-  setTimeout(() => ($("ovMsg").textContent = ""), 6000);
+// ---------- Backup ----------
+// ==== backup-pure-start (no chrome.* calls in here, so it can be tested)
+const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "rateBatch", "rateMinutes"];
+const BACKUP_KEYS = ["kickOverrides", "favorites", ...BACKUP_SETTING_KEYS];
+
+// What goes into the file: corrections, favorites, and display/speed/notification settings.
+// Deliberately NOT included: API keys and secrets, Twitch/Kick logins, cached lookups.
+function buildBackup(s, now) {
+  const settings = {};
+  for (const k of BACKUP_SETTING_KEYS) if (s[k] !== undefined) settings[k] = s[k];
+  return {
+    app: "twitch-kick-bridge",
+    version: 2,
+    exportedAt: new Date(now).toISOString(),
+    overrides: s.kickOverrides || {},
+    favorites: s.favorites || [],
+    settings,
+  };
 }
 
-$("exportOv").addEventListener("click", async () => {
-  const { kickOverrides = {} } = await chrome.storage.local.get("kickOverrides");
-  const n = Object.keys(kickOverrides).length;
-  if (!n) return ovMessage("Nothing to export yet.");
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function backupCounts(file) {
+  return {
+    corrections: Object.keys(file.overrides || {}).length,
+    favorites: (file.favorites || []).length,
+    settings: Object.keys(file.settings || {}).length,
+  };
+}
+function backupSummary(c) {
+  return `${plural(c.corrections, "match correction")}, ${plural(c.favorites, "favorite")} and ${plural(c.settings, "setting")}`;
+}
+
+// What an import (or its dry-run preview) will do / did, as sentences.
+function importLines(r) {
+  const lines = [];
+  const c = r.added + r.updated + r.unchanged;
+  if (c || r.skipped) lines.push(`${plural(c, "match correction")}, merged with yours (${r.added} new, ${r.updated} changed, ${r.unchanged} already there)`);
+  if (r.favoritesRestored !== null) lines.push(`Favorites: your current ones are replaced by the ${r.favoritesRestored} in the file`);
+  if (r.settingsRestored !== null) lines.push(`${plural(r.settingsRestored, "setting")} applied`);
+  return lines;
+}
+function importSkipped(r) {
+  const n = r.skipped + r.favoritesSkipped + r.settingsSkipped;
+  return [...(n ? [`${plural(n, "item")} skipped (invalid or over the limit)`] : []), ...r.warnings];
+}
+function confirmText(r) {
+  const lines = [...importLines(r), ...importSkipped(r)];
+  if (!importLines(r).length) return null; // nothing to restore
+  return `Restore this backup?\n\n${lines.map((l) => `• ${l}`).join("\n")}\n\nYour API keys and logins aren't touched.`;
+}
+function doneText(r) {
+  const parts = [];
+  const c = r.added + r.updated + r.unchanged;
+  if (c) parts.push(`${plural(c, "match correction")} (${r.added} new, ${r.updated} changed, ${r.unchanged} already there)`);
+  if (r.favoritesRestored !== null) parts.push(plural(r.favoritesRestored, "favorite"));
+  if (r.settingsRestored !== null) parts.push(plural(r.settingsRestored, "setting"));
+  const note = importSkipped(r);
+  return `Restored ${parts.join(", ") || "nothing"}.` + (note.length ? ` Note: ${note.join("; ")}.` : "");
+}
+// ==== backup-pure-end
+
+function backupMessage(text) {
+  $("backupMsg").textContent = text;
+  setTimeout(() => ($("backupMsg").textContent = ""), 8000);
+}
+
+async function renderBackupSummary() {
+  const file = buildBackup(await chrome.storage.local.get(BACKUP_KEYS), Date.now());
+  $("backupSummary").textContent = `Right now there's ${backupSummary(backupCounts(file))} to back up.`;
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && BACKUP_KEYS.some((k) => changes[k])) renderBackupSummary();
+});
+renderBackupSummary();
+
+$("exportBackup").addEventListener("click", async () => {
   const now = Date.now();
-  const blob = new Blob([JSON.stringify(buildExport(kickOverrides, now), null, 2)], { type: "application/json" });
+  const file = buildBackup(await chrome.storage.local.get(BACKUP_KEYS), now);
+  const c = backupCounts(file);
+  if (!c.corrections && !c.favorites && !c.settings) return backupMessage("Nothing to back up yet.");
+  const blob = new Blob([JSON.stringify(file, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `kick-bridge-corrections-${new Date(now).toISOString().slice(0, 10)}.json`;
+  link.download = `kick-bridge-backup-${new Date(now).toISOString().slice(0, 10)}.json`;
   document.body.appendChild(link);
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
-  ovMessage(`Exported ${n} correction${n === 1 ? "" : "s"}.`);
+  backupMessage(`Exported ${backupSummary(c)}.`);
 });
 
-$("importOv").addEventListener("click", () => $("importFile").click());
+$("importBackup").addEventListener("click", () => $("importFile").click());
 $("importFile").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   e.target.value = ""; // so choosing the same file again still fires
@@ -472,14 +694,16 @@ $("importFile").addEventListener("change", async (e) => {
   try {
     data = JSON.parse(await file.text());
   } catch (err) {
-    return ovMessage("That file isn't valid JSON.");
+    return backupMessage("That file isn't valid JSON.");
   }
-  const res = await chrome.runtime.sendMessage({ type: "IMPORT_OVERRIDES", data });
-  if (res?.error) return ovMessage(`Import failed: ${res.error}`);
-  const total = res.added + res.updated + res.unchanged;
-  ovMessage(
-    `Imported ${total} correction${total === 1 ? "" : "s"} (${res.added} new, ${res.updated} changed, ${res.unchanged} already there` +
-      (res.skipped ? `, ${res.skipped} skipped as invalid` : "") + ").");
+  // 1) preview (writes nothing), 2) ask, 3) restore
+  const preview = await chrome.runtime.sendMessage({ type: "IMPORT_BACKUP", data, dryRun: true });
+  if (preview?.error) return backupMessage(`Import failed: ${preview.error}`);
+  const question = confirmText(preview);
+  if (!question) return backupMessage("This backup has nothing to restore.");
+  if (!confirm(question)) return backupMessage("Import cancelled. Nothing was changed.");
+  const res = await chrome.runtime.sendMessage({ type: "IMPORT_BACKUP", data });
+  backupMessage(res?.error ? `Import failed: ${res.error}` : doneText(res));
 });
 
 // ---------- Tabs ----------
@@ -497,6 +721,8 @@ function selectTab(name, { focus = false, updateHash = true } = {}) {
   if (focus) tab.focus();
   if (updateHash) history.replaceState(null, "", `#${tab.dataset.tab}`); // refresh keeps your place; the URL can be bookmarked
   if (tab.dataset.tab === "diagnostics") renderDiagnostics();
+  if (tab.dataset.tab === "matches") renderMatchSummary();
+  if (tab.dataset.tab === "general") renderNextRefresh();
 }
 
 TABS.forEach((t, i) => {

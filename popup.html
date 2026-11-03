@@ -12,7 +12,14 @@
     button { padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; border: 0; border-radius: 6px; background: #9146ff; color: #fff; }
     #bar { padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; align-items: center; color: #5c5c66; font-size: 12px; }
     .opts { display: flex; gap: 12px; align-items: center; }
-    #refresh { padding: 1px 8px; background: #efeff1; color: #1f1f23; font-size: 14px; }
+    #refresh { display: inline-flex; align-items: center; padding: 4px 8px; background: #efeff1; color: #1f1f23; }
+    #refresh .ico { display: block; }
+    /* spins while a check is running; freezes while waiting out a rate limit */
+    #refresh.spinning .ico { animation: kb-spin 0.9s linear infinite; }
+    #refresh.paused .ico { animation-play-state: paused; }
+    @keyframes kb-spin { to { transform: rotate(360deg); } }
+    @keyframes kb-pulse { 50% { opacity: .35; } }
+    @media (prefers-reduced-motion: reduce) { #refresh.spinning .ico { animation: kb-pulse 1.2s ease-in-out infinite; } }
     #rows { list-style: none; margin: 0; padding: 0; max-height: 460px; overflow-y: auto; }
     .row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-top: 1px solid #f0f0f2; }
     .row img { border-radius: 50%; flex: none; }
@@ -26,7 +33,10 @@
     #rows.showAll .row.nokick { display: flex; opacity: .55; }
     #searchWrap { padding: 8px 12px 0; }
     #search { width: 100%; box-sizing: border-box; padding: 7px 9px; font: inherit; border: 1px solid #d4d4d8; border-radius: 6px; }
-    #noMatch { padding: 14px 12px; color: #5c5c66; text-align: center; }
+    #noMatch { padding: 20px 14px; color: #5c5c66; text-align: center; }
+    #emptyText { font-weight: 600; color: #3f3f46; }
+    #emptyHint { display: block; margin-top: 3px; font-size: 12px; }
+    #emptyAction { margin-top: 8px; font-size: 12px; }
     .row.nomatch { display: none !important; }
     .row.fav { background: #fffbea; }
     .row.suspect { background: #fff1e0; }
@@ -61,9 +71,13 @@
     </div>
     <div id="bar">
       <span id="status">Loading…</span>
-      <span class="opts"><button id="refresh" title="Refresh live status (Shift+click: recheck everyone)">↻</button><label><input type="checkbox" id="liveOnly"> live only</label><label><input type="checkbox" id="showAll"> show not on Kick</label></span>
+      <span class="opts"><button id="refresh" title="Refresh live status (Shift+click: recheck everyone)" aria-label="Refresh"><svg class="ico" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A7.96 7.96 0 0 0 12 4C7.58 4 4.01 7.58 4.01 12S7.58 20 12 20c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button><label><input type="checkbox" id="liveOnly"> live only</label><label><input type="checkbox" id="showAll"> show not on Kick</label></span>
     </div>
-    <div id="noMatch" hidden></div>
+    <div id="noMatch" hidden>
+      <div id="emptyText"></div>
+      <small id="emptyHint" hidden></small>
+      <div><button id="emptyAction" class="act" hidden></button></div>
+    </div>
     <ul id="rows"></ul>
   </div>
 

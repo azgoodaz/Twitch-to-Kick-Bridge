@@ -10,6 +10,7 @@ let overrideTimes = {}; // when you clicked "It's them" (login -> ms); storage.k
 const RECENT_CONFIRM_MS = 5 * 60 * 1000; // "Undo" and "you confirmed this match" show for this long, then retire
 let favs = new Set();   // favorite streamers (Twitch logins); saved in storage.favorites
 let flashUntil = 0;     // a short message in the status line is showing until this time
+let spinUntil = 0;      // the refresh icon spins until this time after a click, until the worker confirms it started
 let searchFocused = false;
 let runId = 0;          // bumps on every render so older background checks stop themselves
 let currentList = [];   // the follow list currently on screen
@@ -70,9 +71,12 @@ $("connectBtn").addEventListener("click", async () => {
   main();
 });
 
-$("showAll").addEventListener("change", (e) => {
-  $("rows").classList.toggle("showAll", e.target.checked);
-});
+function applyShowAll(on) {
+  $("showAll").checked = on;
+  $("rows").classList.toggle("showAll", on);
+  updateEmpty();
+}
+$("showAll").addEventListener("change", (e) => applyShowAll(e.target.checked));
 
 // "Live only" is purely a display filter: toggling it never re-checks anything.
 function applyLiveOnly(on) {
@@ -89,35 +93,212 @@ chrome.storage.local.get("liveOnly").then((s) => applyLiveOnly(Boolean(s.liveOnl
 // ↻ is the ONLY thing that re-checks streamers after the first load:
 //   click       = refresh live status + check anything unchecked/failed
 //   Shift+click = re-check every follow from scratch (e.g. someone just joined Kick)
-$("refresh").addEventListener("click", (e) => {
-  if (currentList.length) renderFromCache(currentList, e.shiftKey ? "all" : "manual");
-});
+let fetchingFollows = false; // true while we ask Twitch for your current follow list
+
+// How many streamers Twitch says you follow right now. One tiny request (first=1) instead of the whole list.
+async function probeFollowCount(clientId, user) {
+  const url = new URL("https://api.twitch.tv/helix/channels/followed");
+  url.searchParams.set("user_id", user.userId);
+  url.searchParams.set("first", "1");
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${user.token}`, "Client-Id": clientId } });
+  if (!r.ok) throw Object.assign(new Error(`Twitch API error ${r.status}`), { code: r.status });
+  const j = await r.json();
+  return typeof j.total === "number" ? j.total : null;
+}
+
+// The follow count saved with the list (Twitch's own number), or null when it can't be trusted:
+// no saved list (cleared or never loaded), a different Twitch account, or saved before counts were kept.
+async function getStoredFollowCount(userId) {
+  const s = await chrome.storage.local.get(["followsCache", "followCount"]);
+  if (!s.followsCache || s.followsCache.userId !== userId || typeof s.followCount !== "number") return null;
+  return s.followCount;
+}
+
+// The two-way refresh:
+//   same count as the saved one  -> { fetched: false }: keep the list, carry on with the normal refresh
+//   count went up or down        -> fetch the whole list, save it and the new count: { fetched: true, list, before, after }
+// force (Shift+click) always fetches, since one streamer followed and another unfollowed leaves the count unchanged.
+// Throws with .code = 401 if the Twitch login expired.
+async function refreshFollowsNow({ force = false } = {}) {
+  const s = await chrome.storage.local.get(["twitchId", "twitchUser"]);
+  const user = s.twitchUser;
+  if (!s.twitchId || !user || user.exp < Date.now() + 60_000) {
+    throw Object.assign(new Error("Your Twitch session expired."), { code: 401 });
+  }
+  const before = await getStoredFollowCount(user.userId);
+  if (!force && before !== null) {
+    const total = await probeFollowCount(s.twitchId, user);
+    if (total !== null && total === before) return { fetched: false, before, after: before };
+  }
+  const list = await fetchFollows(s.twitchId, user, false); // also saves the new count
+  const after = (await chrome.storage.local.get("followCount")).followCount ?? list.length;
+  return { fetched: true, list, before, after };
+}
+
+async function startManualCheck(everyone) {
+  if (!view.ready) return; // nothing loaded yet
+  if (scanRunning() || fetchingFollows) return flash("A check is already running."); // one at a time
+  spinUntil = Date.now() + 2500;            // start spinning at once...
+  updateSpinner();
+  setTimeout(updateSpinner, 2600);          // ...and stop again if nothing needed checking
+
+  // 1) Did you follow (or unfollow) anyone since the list was saved? Ask Twitch, so new follows get checked too.
+  let list = currentList;
+  fetchingFollows = true;
+  updateSpinner();
+  try {
+    const r = await refreshFollowsNow({ force: everyone });
+    if (r.fetched) {
+      // The follow count changed (or this is a full re-check): the feed is rebuilt from Twitch's current
+      // list, so unfollowed streamers drop out and new follows appear (and get checked).
+      const known = new Set(currentList.map((f) => f.login));
+      const now = new Set(r.list.map((f) => f.login));
+      const added = r.list.filter((f) => !known.has(f.login)).length;
+      const removed = currentList.filter((f) => !now.has(f.login)).length;
+      list = r.list;
+      const notes = [];
+      if (added) notes.push(`${added} new follow${added === 1 ? "" : "s"} found, checking ${added === 1 ? "it" : "them"} now`);
+      if (removed) notes.push(`${removed} unfollowed`);
+      const head = r.before !== null && r.after !== r.before ? `Follows ${r.before} → ${r.after}: ` : "";
+      if (notes.length) flash(`${head}${notes.join(" · ")}.`);
+    }
+    // else: same count as the stored one. Nothing to rebuild; carry on with the normal refresh of the current feed.
+  } catch (e) {
+    if (e.code === 401) {
+      fetchingFollows = false;
+      updateSpinner();
+      return onFollowsError(e); // shows the Connect screen
+    }
+    chrome.runtime.sendMessage({ type: "LOG_ERROR", source: "Twitch follows", message: e.message }).catch(() => {});
+    flash("Couldn't refresh your follow list. Checking the saved one.");
+  } finally {
+    fetchingFollows = false;
+    updateSpinner();
+  }
+
+  // 2) Check whatever needs it (new follows are unchecked, so they're included).
+  renderFromCache(list, everyone ? "all" : "manual");
+}
+$("refresh").addEventListener("click", (e) => startManualCheck(e.shiftKey));
+
+// The refresh icon spins while streamers are being checked (from this click, from the
+// first load, or from a check that was already running when you opened the popup).
+// It freezes while the worker waits out a Kick rate limit.
+// How old the oldest live status on screen is, e.g. "2h ago" (null before anything is checked).
+function lastUpdatedAgo() {
+  const { oldest } = matchCounts();
+  return oldest === Infinity ? null : fmtAgo(Date.now() - oldest);
+}
+
+function updateSpinner() {
+  const b = $("refresh");
+  const running = scanRunning();
+  const paused = running && (scan?.pausedUntil || 0) > Date.now();
+  const spinning = running || Date.now() < spinUntil || fetchingFollows;
+  b.classList.toggle("spinning", spinning);
+  b.classList.toggle("paused", paused);
+  b.setAttribute("aria-busy", String(spinning));
+  const ago = spinning ? null : lastUpdatedAgo();
+  const progress = running && scan?.total ? ` ${scan.done} of ${scan.total}` : "";
+  const eta = running && scan?.etaMs > 60000 ? ` · about ${Math.round(scan.etaMs / 60000)} min left` : "";
+  b.title = paused ? "Kick asked us to slow down: resuming shortly"
+    : fetchingFollows ? "Looking for new follows…"
+    : spinning ? `Checking your follows…${progress}${eta}`
+    : `${ago ? `Updated ${ago} · ` : ""}Refresh live status (Shift+click: recheck everyone)`;
+}
 
 // ---------- search ----------
 // Filters by display name or login as you type. While a search is active,
 // streamers who aren't on Kick are shown too (dimmed), so you can also use it to
 // answer "is X on Kick?". Combines with the "live only" filter.
 function applySearch() {
-  const raw = $("search").value.trim();
-  const q = raw.toLowerCase();
-  const liveOnly = $("liveOnly").checked;
+  const q = $("search").value.trim().toLowerCase();
   const ul = $("rows");
   ul.classList.toggle("searching", q !== "");
-
-  let visible = 0;
   for (const li of ul.children) {
     const hit = !q || li.dataset.name.includes(q) || (li.dataset.login || "").includes(q);
     li.classList.toggle("nomatch", !hit);
-    if (hit && (!liveOnly || li.classList.contains("live"))) visible++;
   }
-  const none = q !== "" && visible === 0;
-  $("noMatch").hidden = !none;
-  if (none) {
-    $("noMatch").textContent = liveOnly
-      ? `No live streamer matches “${raw}”.`
-      : `No followed streamer matches “${raw}”.`;
-  }
+  updateEmpty();
 }
+
+// ---------- empty states ----------
+// What to say when the list shows nothing, so a blank popup is never a mystery.
+// emptyState is pure (numbers in, message out); updateEmpty gathers the numbers.
+function emptyState({ follows, query, liveOnly, showAll, onKick, unchecked, running, done, total, checkedAgo }) {
+  if (!follows) return { text: "You don't follow anyone on Twitch yet." };
+  if (running) return { text: `Checking your follows… ${done}/${total}` };
+  if (query) {
+    return liveOnly
+      ? { text: `No live streamer matches “${query}”.`, action: { id: "includeOffline", label: "Include offline" } }
+      : { text: `No followed streamer matches “${query}”.` };
+  }
+  if (unchecked === follows) {
+    return { text: "Nothing has been checked yet.", hint: "Press ↻ to check your follows.", action: { id: "check", label: "Check now" } };
+  }
+  if (!onKick) {
+    return {
+      text: "None of the streamers you follow are on Kick yet.",
+      hint: "Press ↻ to look again.",
+      action: liveOnly || !showAll ? { id: "showEveryone", label: "Show everyone" } : null,
+    };
+  }
+  if (liveOnly) {
+    return {
+      text: "Nobody is live on Kick right now.",
+      hint: checkedAgo ? `Last checked ${checkedAgo}. Press ↻ to refresh.` : "Press ↻ to refresh.",
+      action: { id: "includeOffline", label: "Show everyone on Kick" },
+    };
+  }
+  return null;
+}
+
+let emptyActionId = null;
+
+function updateEmpty() {
+  if (!view.ready) return; // nothing loaded yet: the status line says "Loading…"
+  const liveOnly = $("liveOnly").checked;
+  const showAll = $("showAll").checked;
+  const query = $("search").value.trim();
+
+  // the same rules the stylesheet uses to hide rows
+  let visible = 0;
+  for (const li of $("rows").children) {
+    const c = li.classList;
+    if (c.contains("nomatch")) continue;
+    if (c.contains("nokick") && !showAll && !query) continue;
+    if (liveOnly && !c.contains("live")) continue;
+    visible++;
+  }
+
+  let msg = null;
+  if (!visible) {
+    const c = matchCounts();
+    msg = emptyState({
+      follows: view.list.length, query, liveOnly, showAll,
+      onKick: c.found, unchecked: c.unchecked,
+      running: scanRunning(), done: scan?.done, total: scan?.total,
+      checkedAgo: c.oldest === Infinity ? null : fmtAgo(Date.now() - c.oldest),
+    });
+  }
+  $("noMatch").hidden = !msg;
+  emptyActionId = msg?.action ? msg.action.id : null;
+  if (!msg) return;
+  $("emptyText").textContent = msg.text;
+  $("emptyHint").textContent = msg.hint || "";
+  $("emptyHint").hidden = !msg.hint;
+  $("emptyAction").hidden = !msg.action;
+  if (msg.action) $("emptyAction").textContent = msg.action.label;
+}
+
+$("emptyAction").addEventListener("click", () => {
+  if (emptyActionId === "check") return startManualCheck(false);
+  if (emptyActionId === "showEveryone") applyShowAll(true);
+  if ($("liveOnly").checked) {
+    applyLiveOnly(false);
+    chrome.storage.local.set({ liveOnly: false });
+  }
+});
 
 $("search").addEventListener("input", applySearch);
 $("search").addEventListener("keydown", (e) => {
@@ -137,6 +318,7 @@ async function fetchFollows(clientId, user, quiet) {
   // 1) page through followed channels
   const ids = [];
   let after = null;
+  let total = null; // Twitch's own count of who you follow (can be higher than the list: deleted/banned accounts have no profile)
   do {
     const url = new URL("https://api.twitch.tv/helix/channels/followed");
     url.searchParams.set("user_id", user.userId);
@@ -145,6 +327,7 @@ async function fetchFollows(clientId, user, quiet) {
     const r = await fetch(url, { headers });
     if (!r.ok) throw fail(r);
     const j = await r.json();
+    if (total === null && typeof j.total === "number") total = j.total;
     for (const d of j.data) ids.push(d.broadcaster_id);
     after = j.pagination?.cursor || null;
     if (!quiet) setStatus(`Loading follows… ${ids.length}`);
@@ -163,7 +346,11 @@ async function fetchFollows(clientId, user, quiet) {
   }
   list.sort((a, b) => a.name.localeCompare(b.name));
 
-  await chrome.storage.local.set({ followsCache: { at: Date.now(), userId: user.userId, list } });
+  // The count is saved WITH the list, so the two can never disagree about what was last fetched.
+  await chrome.storage.local.set({
+    followsCache: { at: Date.now(), userId: user.userId, list },
+    followCount: typeof total === "number" ? total : ids.length,
+  });
   return list;
 }
 
@@ -382,10 +569,9 @@ let uiTimer = null;
 
 const scanRunning = () => Boolean(scan?.running) && Date.now() - (scan.heartbeat || 0) < 20000;
 
-function updateStatus() {
-  if (Date.now() < flashUntil) return; // let a short message be read
+// What the saved results say about your follows (lookalikes and "not them" excluded from "on Kick").
+function matchCounts() {
   const { list, results } = view;
-  if (!list.length) return;
   let found = 0, liveNow = 0, unchecked = 0, failed = 0, lookalikes = 0, reverify = 0, oldest = Infinity;
   for (const f of list) {
     const e = results.get(f.login);
@@ -400,8 +586,17 @@ function updateStatus() {
     if (e.value.isLive) liveNow++;
     oldest = Math.min(oldest, e.at);
   }
+  return { found, liveNow, unchecked, failed, lookalikes, reverify, oldest };
+}
+
+function updateStatus() {
+  if (Date.now() < flashUntil) return; // let a short message be read
+  const { list } = view;
+  if (!list.length) return;
+  // Kept short on purpose: the count of possible impersonators lives in Settings > Matches,
+  // and "updated ... ago" is in the refresh button's tooltip.
+  const { found, liveNow, unchecked, failed, reverify } = matchCounts();
   const parts = [`${list.length} follows`, `${found} on Kick`, `${liveNow} live`];
-  if (lookalikes) parts.push(`⚠ ${lookalikes} possible impersonator${lookalikes > 1 ? "s" : ""}`);
   if (scanRunning()) {
     const wait = (scan.pausedUntil || 0) - Date.now();
     if (wait > 0) {
@@ -416,7 +611,6 @@ function updateStatus() {
     if (scan?.liveFailed) parts.push("live update failed");
     if (unchecked + failed) parts.push(`${unchecked + failed} not checked — press ↻`);
     else if (reverify) parts.push(`${reverify} match${reverify > 1 ? "es" : ""} to verify — press ↻`);
-    else if (found) parts.push(`updated ${fmtAgo(Date.now() - oldest)}`);
   }
   setStatus(parts.join(" · "));
 }
@@ -426,6 +620,7 @@ function scheduleUI() {
   uiTimer = setTimeout(() => {
     if (!scanRunning()) sortRows($("rows")); // don't shuffle rows under your cursor mid-check
     updateStatus();
+    updateEmpty();
   }, 250);
 }
 
@@ -449,6 +644,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
       touched = true;
     } else if (key === "scanState") {
       scan = ch.newValue || null;
+      updateSpinner();
       touched = true;
     } else if (key.startsWith("kc:") && ch.newValue) {
       const login = key.slice(3);
@@ -461,7 +657,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
   if (touched) scheduleUI();
 });
-setInterval(updateStatus, 1000); // countdowns, and notices a worker that died mid-check
+setInterval(() => { updateStatus(); updateEmpty(); updateSpinner(); }, 1000); // countdowns, and notices a worker that died mid-check
 // Retire the Undo link / "you confirmed this match" text once the window has passed.
 setInterval(() => {
   for (const [login, li] of view.rows) {
@@ -485,6 +681,7 @@ async function renderFromCache(list, mode = "view") {
   const stored = await chrome.storage.local.get([...list.map((f) => `kc:${f.login}`), "scanState", "favorites", "kickOverrides", "kickOverrideTimes"]);
   if (myRun !== runId) return;
   scan = stored.scanState || null;
+  updateSpinner(); // opened while a check is already running? the icon spins
   favs = new Set(stored.favorites || []);
   overrides = stored.kickOverrides || {};
   overrideTimes = stored.kickOverrideTimes || {};
@@ -513,7 +710,7 @@ async function renderFromCache(list, mode = "view") {
     if (p === "full") full.push({ login: f.login, bio: f.bio, force: Boolean(entry) });
     else if (p === "live") live.push({ login: f.login, userId: entry.value.kickUserId });
   }
-  view = { list, rows, results };
+  view = { list, rows, results, ready: true };
   sortRows(ul); // same tick as the inserts, so no visible reshuffle
   applySearch(); // keep any text typed in the search box applied after a re-render
   updateStatus();
@@ -525,6 +722,8 @@ async function renderFromCache(list, mode = "view") {
   if (full.length || live.length) {
     const res = await chrome.runtime.sendMessage({ type: "START_SCAN", full, live });
     if (myRun === runId && res?.error) setStatus(`Couldn't start check: ${res.error}`);
+  } else if (mode === "manual" || mode === "all") {
+    flash("Everything is already up to date."); // you pressed refresh and there was nothing to do
   }
 }
 
