@@ -20,7 +20,7 @@ Steps:
 
 Once extension is added and if you want to update this extension again, download the newest release, unzip it, replace old files, go to 'Manage Extensions' > Find 'Twitch to Kick Bridge' > Press 'Reload' 
 
-![Example / Preview](https://pbs.twimg.com/media/HV1reCDWkAExvnk?format=png "Example / Preview")
+![Example / Preview](https://cdn.discordapp.com/attachments/413927920394960907/1567250521499242606/image.png?ex=6aeb7f4a&is=6aea2dca&hm=26ef8b1e769c4797531ec131df39df50eeb690fd6ef6244a96453cb3859f042c& "Example / Preview")
 
 -----
 
