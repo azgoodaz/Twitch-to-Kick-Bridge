@@ -1,8 +1,8 @@
 # Twitch to Kick Bridge
 
-Shows a Kick profile button on Twitch channels when the streamer is also on Kick (a great tool to find/support multi-streamers).
+Follow your Twitch streamer on the Kick platform in a simple click. This extension shows a Kick profile button on Twitch channel(s) when the streamer is also on Kick (a great tool to find/support multi-streamers). 
 
-An extension like this wasn't available, and let's face it. It's hard to know what streamers are using Kick or not.
+An extension like this wasn't available, and let's face it... It's hard to know what streamers are using Kick or not. Favorite your streamer and get notified.
 
 Steps:
 
@@ -23,5 +23,7 @@ Once extension is added and if you want to update this extension again, download
 ![Example / Preview](https://cdn.discordapp.com/attachments/413927920394960907/1567250521499242606/image.png?ex=6aeb7f4a&is=6aea2dca&hm=26ef8b1e769c4797531ec131df39df50eeb690fd6ef6244a96453cb3859f042c& "Example / Preview")
 
 -----
+
+Enjoy the extension? Star it.
 
 If you'd like to contribute to this, feel free to fork it, list your changes and I can update it.
