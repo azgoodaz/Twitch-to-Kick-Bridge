@@ -32,6 +32,11 @@
     .tab[aria-selected="true"] { color: #1f1f23; border-bottom-color: #53fc18; }
     .tab:focus-visible { outline: 2px solid #2563eb; outline-offset: -2px; }
     section[role="tabpanel"] > h2:first-child { margin-top: 14px; }
+    details { border: 1px solid #e4e4e7; border-radius: 8px; padding: 0 14px; margin: 8px 0; }
+    details summary { cursor: pointer; font-weight: 600; padding: 11px 0; }
+    details[open] summary { border-bottom: 1px solid #f0f0f2; margin-bottom: 8px; }
+    details p, details li { margin: 6px 0; }
+    details ul, details ol { margin: 6px 0 10px; padding-left: 22px; }
     .next { margin: 10px 0 4px; padding: 12px 14px; border: 1px solid #e4e4e7; border-radius: 8px; }
     .next-head { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
     .next.warn .next-head { color: #b45309; }
@@ -51,6 +56,7 @@
     <button class="tab" role="tab" id="tab-matches" data-tab="matches" aria-controls="panel-matches" aria-selected="false" tabindex="-1">Matches</button>
     <button class="tab" role="tab" id="tab-backup" data-tab="backup" aria-controls="panel-backup" aria-selected="false" tabindex="-1">Backup</button>
     <button class="tab" role="tab" id="tab-diagnostics" data-tab="diagnostics" aria-controls="panel-diagnostics" aria-selected="false" tabindex="-1">Diagnostics</button>
+    <button class="tab" role="tab" id="tab-about" data-tab="about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About / Info</button>
   </div>
 
   <section role="tabpanel" id="panel-general" aria-labelledby="tab-general">
@@ -192,6 +198,144 @@
   </div>
   <small>Clear cache removes saved lookups, the follow list, cached app tokens, error history and any running check.
     Your logins, credentials and settings stay.</small>
+  </section>
+
+  <section role="tabpanel" id="panel-about" aria-labelledby="tab-about" hidden>
+  <h2>About Twitch → Kick Bridge</h2>
+  <p><small>Version <span id="aboutVersion"></span></small></p>
+  <p>Shows which of the streamers you follow on Twitch also have a Kick channel, whether they're live there, and a
+    one-click link to their Kick profile. It runs entirely in your browser: there is no server of ours in between.</p>
+
+  <details open>
+    <summary>What refresh (↻) does</summary>
+    <p>Press ↻ in the popup (or “Check now” when the list is empty). It works in two steps:</p>
+    <ol>
+      <li><b>It counts your follows.</b> One small request asks Twitch how many streamers you follow right now and
+        compares that with the number saved with your list.</li>
+      <li><b>Then it decides.</b>
+        <ul>
+          <li><b>Same number:</b> your list is kept and the normal refresh runs on your current feed. It updates live
+            status for everyone known to be on Kick (50 per request) and checks anyone who was never checked, failed
+            before, was saved by an older version, or was marked “not on Kick” more than a week ago.</li>
+          <li><b>Number went up or down:</b> it fetches your full follow list, saves it with the new number, and rebuilds
+            the feed. Streamers you unfollowed disappear, new follows appear and get checked. The status line says what
+            changed, for example “Follows 951 → 954: 3 new follows found, checking them now.”</li>
+        </ul></li>
+    </ol>
+    <p><b>Shift+click</b> always fetches the full list and re-checks everyone. Use it after following one streamer and
+      unfollowing another, which leaves the count unchanged.</p>
+    <p>The icon spins while it works. Hover it to see how long ago everything was updated, or the progress of a running
+      check. If your Twitch login has expired you'll be asked to connect again.</p>
+  </details>
+
+  <details>
+    <summary>What runs automatically</summary>
+    <ul>
+      <li><b>The first time</b> (nothing saved yet): it loads your follows and checks them all in the background.</li>
+      <li><b>Favorites:</b> checked every hour, and right after you star someone. One request covers all of them.</li>
+      <li><b>An interrupted check</b> (Chrome restarted, the background worker was stopped) carries on by itself.</li>
+      <li><b>Opening the popup</b> shows what's saved instantly and never starts a check. If the saved follow list is
+        over an hour old it quietly refreshes the list from Twitch (a Twitch-only request).</li>
+    </ul>
+    <p>Nothing else runs on its own. Live status otherwise changes only when you press ↻.</p>
+  </details>
+
+  <details>
+    <summary>How streamers are matched, and the warning labels</summary>
+    <p>Kick channels are matched by name (underscores become hyphens), so the Kick account with the same name isn't
+      always the same person. Each match gets a level:</p>
+    <ul>
+      <li><b>Confirmed:</b> the streamer's own Twitch bio links to the Kick channel (only they can write that), or the
+        Kick channel is verified and has the same profile picture.</li>
+      <li><b>Likely:</b> Kick-verified, or the same profile picture.</li>
+      <li><b>Unconfirmed:</b> same name and nothing else to go on. Labeled “unconfirmed (same username)”.</li>
+      <li><b>Possible impersonator:</b> a different profile picture, not Kick-verified, and a tiny Kick following (under
+        100 followers, or under 500 if they're a Twitch partner). It shows a ⚠ warning, sits below your other matches,
+        never counts as live, can't be starred, and is left out of the toolbar badge and notifications.</li>
+    </ul>
+    <p>A link in the Kick bio back to Twitch is not counted as proof, since anyone can write that. The verified badge,
+      follower count and picture come from a Kick page that isn't an official API and can fail; when it does, the match
+      can't rise above “unconfirmed”. Pictures are compared by a small fingerprint, so a real streamer with a different
+      avatar and a tiny Kick audience can be flagged. Use “It's them” to correct it.</p>
+  </details>
+
+  <details>
+    <summary>Checking speed, batches and rate limits</summary>
+    <p>Checks are spread evenly. For example, 200 per 5 minutes is one check every 1.5 seconds. A long list is worked
+      through batch after batch until every streamer is checked, even if you close the popup or restart Chrome.
+      Settings → General shows how long your list will take, with a live countdown to the next batch.</p>
+    <p>If Kick asks us to slow down, the check waits (1, 2, 4, 8, then 10 minutes between tries) and carries on with the
+      same streamer. It gives up only after 12 rate limits in a row, about an hour and a half, and leaves the rest for
+      you to restart with ↻. A streamer that can't be checked is skipped (see Diagnostics) so one failure doesn't stop
+      the rest. A change to the speed setting reaches a running check within ten streamers.</p>
+  </details>
+
+  <details>
+    <summary>Favorites and notifications</summary>
+    <p>Star up to 10 streamers (only those on Kick). They stay at the top of the list and their live status is checked
+      every hour. With notifications on (Settings → Favorites), you're told when a favorite goes live: one hourly check
+      saw them offline and the next sees them live. The first check after starring only notes their state, so starring
+      someone who is already live stays quiet. Clicking a notification opens their Kick channel.</p>
+    <p>A stream that starts and ends between two hourly checks can't be seen, and Chrome has to be running. Possible
+      impersonators are never tracked. The toolbar badge (Settings → General) shows how many followed streamers were live
+      on Kick at the last check.</p>
+  </details>
+
+  <details>
+    <summary>Using the popup</summary>
+    <ul>
+      <li><b>Search</b> filters by name. While you search, streamers who aren't on Kick are shown dimmed so you can see
+        they aren't. “Live only” shows just who's live, and “show not on Kick” shows everyone.</li>
+      <li><b>Hover a status line</b> to see why a match got its level.</li>
+      <li><b>Kick ↗</b> opens the channel in a background tab so the popup stays open.</li>
+      <li><b>Not them / It's them</b> correct a match. “It's them” shows an Undo for 5 minutes; Settings → Matches keeps
+        an Undo for good.</li>
+    </ul>
+  </details>
+
+  <details>
+    <summary>Your corrections and backups</summary>
+    <p>Your corrections always win over the automatic result. Settings → Backup saves your corrections, favorites and
+      settings to a file you can restore later. Backups never include API keys, secrets, your Twitch or Kick logins, or
+      cached lookups. “Clear cache” removes saved lookups, the follow list, saved pictures, cached tokens and error history, and stops a
+      running check. Your logins, API keys, settings, favorites and corrections stay.</p>
+  </details>
+
+  <details>
+    <summary>Where your data lives</summary>
+    <p>Everything is stored in this browser's extension storage: your API keys, login tokens, saved lookups, favorites,
+      corrections and settings, plus small thumbnails of the profile pictures so they load quickly. Nothing is sent to us,
+      because there is no server. The extension talks only to:</p>
+    <ul>
+      <li><b>Twitch:</b> api.twitch.tv and id.twitch.tv, plus profile pictures from static-cdn.jtvnw.net, and the
+        twitch.tv pages it adds its button to.</li>
+      <li><b>Kick:</b> api.kick.com and id.kick.com, kick.com for profile details, and files.kick.com for pictures.</li>
+    </ul>
+    <p>The Twitch login only asks to read who you follow. The Kick login only asks to read your profile and isn't used for
+      anything yet. Removing the extension deletes all of this, so export a backup first.</p>
+  </details>
+
+  <details>
+    <summary>Known limits</summary>
+    <ul>
+      <li>Kick has no public follow action, so “Kick ↗” opens their profile and you follow there.</li>
+      <li>Matching is by name. Read the labels, and correct the ones we get wrong.</li>
+      <li>Hourly checks miss short streams. A plain ↻ can't see a follow plus an unfollow that cancel out (Shift+click can).</li>
+      <li>The Kick profile page isn't an official API and may change or be blocked.</li>
+      <li>Kick's rate limits aren't published. The default pace is a safe guess that you can lower.</li>
+    </ul>
+  </details>
+
+  <details>
+    <summary>Troubleshooting</summary>
+    <ul>
+      <li><b>Diagnostics</b> shows token status, recent errors, rate-limit state and cache size. “Copy diagnostics” never
+        includes keys or tokens.</li>
+      <li><b>API keys</b> has “Test a lookup” to check your Kick and Twitch setup.</li>
+      <li>Nothing showing up? Check <b>Connections</b> and <b>API keys</b>, then press ↻ in the popup.</li>
+      <li>Something looks stale or stuck? <b>Clear cache</b> in Diagnostics, then open the popup to start fresh.</li>
+    </ul>
+  </details>
   </section>
 
   <script src="options.js"></script>

@@ -861,6 +861,7 @@ async function clearCache() {
   const all = await chrome.storage.local.get(null);
   const keys = Object.keys(all).filter((k) => k.startsWith("kc:") || CACHE_KEYS.includes(k));
   await chrome.storage.local.remove(keys);
+  try { if (typeof caches !== "undefined") await caches.delete("kb-avatars-v1"); } catch (e) { /* nothing saved */ }
   scanCancelled = false;
   return { removed: keys.length };
 }

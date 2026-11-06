@@ -214,7 +214,7 @@ const bytesOf = (v) => new Blob([JSON.stringify(v)]).size;
 
 // all = everything in chrome.storage.local, total = bytes in use, quota = byte limit.
 // Returns [{ group } | { label, text, status }], status = "ok" | "warn" | "bad" | "".
-function buildDiagnostics(all, total, now, quota, extra = {}) {
+function buildDiagnostics(all, total, now, quota, extra = {}) { // extra: { favNextAt, avatarCount }
   const rows = [];
   const group = (name) => rows.push({ group: name });
   const add = (label, text, status = "") => rows.push({ label, text, status });
@@ -320,6 +320,7 @@ function buildDiagnostics(all, total, now, quota, extra = {}) {
   add("Follow list", fc
     ? `${fc.list.length} follows${typeof fcount === "number" && fcount !== fc.list.length ? ` (Twitch counts ${fcount}; the difference has no profile, e.g. deleted or banned)` : ""}, saved ${ago(now - fc.at)} (~${fmtBytes(bytesOf(fc))})`
     : "Not loaded yet");
+  add("Pictures", extra.avatarCount ? `${extra.avatarCount} thumbnails saved (so they load without the network)` : "None saved yet. They're saved as you scroll");
   if (typeof fcount === "number") add("Follow count", `${fcount}. The refresh button compares Twitch's current number with this one`);
   add("Storage", `${fmtBytes(total)} used of ${fmtBytes(quota)}`, total > quota * 0.8 ? "warn" : "");
 
@@ -345,7 +346,9 @@ async function renderDiagnostics() {
   const total = await chrome.storage.local.getBytesInUse(null);
   const quota = chrome.storage.local.QUOTA_BYTES || 10485760;
   const favAlarm = await chrome.alarms.get("kick-bridge-favs");
-  lastDiagRows = buildDiagnostics(all, total, Date.now(), quota, { favNextAt: favAlarm?.scheduledTime });
+  let avatarCount = 0;
+  try { avatarCount = typeof caches === "undefined" ? 0 : (await (await caches.open("kb-avatars-v1")).keys()).length; } catch (e) { /* none */ }
+  lastDiagRows = buildDiagnostics(all, total, Date.now(), quota, { favNextAt: favAlarm?.scheduledTime, avatarCount });
 
   const table = $("diag");
   table.textContent = "";
@@ -705,6 +708,8 @@ $("importFile").addEventListener("change", async (e) => {
   const res = await chrome.runtime.sendMessage({ type: "IMPORT_BACKUP", data });
   backupMessage(res?.error ? `Import failed: ${res.error}` : doneText(res));
 });
+
+$("aboutVersion").textContent = chrome.runtime.getManifest().version;
 
 // ---------- Tabs ----------
 // ==== tabs-start

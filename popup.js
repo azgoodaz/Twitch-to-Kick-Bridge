@@ -358,16 +358,104 @@ const loginSet = (list) => list.map((f) => f.login).sort().join(",");
 
 // ---------- rows ----------
 
+// ---------- profile pictures ----------
+// Twitch gives us a 300x300 picture URL per streamer, but a row shows 32 px. So:
+//   1. nothing is requested until the row is actually on screen (hidden rows and rows far down the
+//      list never load anything),
+//   2. the request is for a 70x70 thumbnail (sharp enough for 32 px, even on a high-density screen),
+//   3. each thumbnail is kept in Cache Storage (separate from your settings, so it never bloats them),
+//      so later opens show it straight from disk with no network at all.
+const AVATAR_CACHE = "kb-avatars-v1";
+const avatarBlobUrls = new Map(); // thumbnail URL -> object URL, for this popup session
+const avatarLoading = new Map();  // thumbnail URL -> download in progress (so it's never fetched twice at once)
+let avatarObserver = null;
+
+// Twitch's size is part of the file name; swap 300x300 for 70x70. Anything else is left alone.
+function thumbUrl(u) {
+  return typeof u === "string" ? u.replace(/-profile_image-300x300(\.[a-z]+)$/i, "-profile_image-70x70$1") : u;
+}
+
+// An object URL for this picture: from our saved copy if we have one, otherwise downloaded once and saved.
+// Resolves to null on any failure (offline, 404, no storage), never throws.
+function avatarFor(url) {
+  if (avatarBlobUrls.has(url)) return Promise.resolve(avatarBlobUrls.get(url));
+  if (!avatarLoading.has(url)) {
+    avatarLoading.set(url, (async () => {
+      try {
+        const cache = await caches.open(AVATAR_CACHE);
+        let res = await cache.match(url);
+        if (!res) {
+          const r = await fetch(url);
+          if (!r.ok) return null;
+          await cache.put(url, r.clone());
+          res = r;
+        }
+        const objectUrl = URL.createObjectURL(await res.blob());
+        avatarBlobUrls.set(url, objectUrl);
+        return objectUrl;
+      } catch (e) {
+        return null;
+      } finally {
+        avatarLoading.delete(url);
+      }
+    })());
+  }
+  return avatarLoading.get(url);
+}
+
+// The thumbnail if there is one, else the full-size picture; null if neither can be had.
+async function avatarSrc(original) {
+  const thumb = thumbUrl(original);
+  return (await avatarFor(thumb)) || (thumb !== original ? await avatarFor(original) : null);
+}
+
+async function loadAvatar(img, original) {
+  // Worst case the browser loads the full-size picture itself, as before: a row is never left blank.
+  img.src = (await avatarSrc(original)) || original;
+}
+
+function resetAvatarObserver() {
+  if (avatarObserver) avatarObserver.disconnect(); // rows are rebuilt on each render: let go of the old ones
+  avatarObserver = null;
+}
+
+function observeAvatar(img, original) {
+  img._avatar = original;
+  if (!avatarObserver) {
+    avatarObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue; // hidden (display: none) rows never intersect
+        avatarObserver.unobserve(e.target);
+        loadAvatar(e.target, e.target._avatar);
+      }
+    }, { root: $("rows"), rootMargin: "300px" }); // start a little before a row scrolls in
+  }
+  avatarObserver.observe(img);
+}
+
+// Drop saved pictures of streamers you no longer follow (or whose picture changed).
+async function pruneAvatars(list) {
+  try {
+    const keep = new Set();
+    for (const f of list) { keep.add(thumbUrl(f.img)); keep.add(f.img); }
+    const cache = await caches.open(AVATAR_CACHE);
+    for (const req of await cache.keys()) if (!keep.has(req.url)) await cache.delete(req);
+  } catch (e) { /* housekeeping only */ }
+}
+
 function makeRow(f) {
   const li = document.createElement("li");
   li.className = "row nokick";
   li.dataset.name = f.name.toLowerCase();
   li.dataset.login = f.login;
 
+  // No picture is requested here. It's fetched (as a small thumbnail, from our own saved copy when we
+  // have one) only when the row scrolls into view; until then the grey circle from the CSS shows.
   const img = new Image();
-  img.src = f.img;
   img.width = img.height = 32;
   img.alt = "";
+  img.decoding = "async";
+  observeAvatar(img, f.img);
 
   const mid = document.createElement("div");
   mid.className = "mid";
@@ -688,6 +776,7 @@ async function renderFromCache(list, mode = "view") {
 
   const ul = $("rows");
   ul.textContent = "";
+  resetAvatarObserver();
   const rows = new Map();
   const results = new Map(); // login -> { value, at }
   const full = [];
@@ -711,6 +800,7 @@ async function renderFromCache(list, mode = "view") {
     else if (p === "live") live.push({ login: f.login, userId: entry.value.kickUserId });
   }
   view = { list, rows, results, ready: true };
+  setTimeout(() => pruneAvatars(list), 5000); // tidy the saved pictures once things have settled
   sortRows(ul); // same tick as the inserts, so no visible reshuffle
   applySearch(); // keep any text typed in the search box applied after a re-render
   updateStatus();
