@@ -9,6 +9,7 @@
     h2 { font-size: 15px; margin-top: 24px; }
     label { display: block; margin: 10px 0 4px; font-weight: 600; }
     input { width: 100%; padding: 8px; box-sizing: border-box; font: inherit; }
+    select { width: 100%; padding: 8px; box-sizing: border-box; font: inherit; }
     button { margin-top: 14px; padding: 8px 14px; font: inherit; cursor: pointer; }
     .row { display: flex; gap: 8px; align-items: center; }
     .row input { flex: 1; }
@@ -49,6 +50,7 @@
   <small>Credentials are stored locally in this browser profile (dev/testing use).</small>
 
   <div class="tabs" role="tablist" aria-label="Settings sections">
+    <button class="tab" role="tab" id="tab-about" data-tab="about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About / Info</button>
     <button class="tab" role="tab" id="tab-general" data-tab="general" aria-controls="panel-general" aria-selected="true" tabindex="0">General</button>
     <button class="tab" role="tab" id="tab-connections" data-tab="connections" aria-controls="panel-connections" aria-selected="false" tabindex="-1">Connections</button>
     <button class="tab" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">API keys</button>
@@ -56,7 +58,6 @@
     <button class="tab" role="tab" id="tab-matches" data-tab="matches" aria-controls="panel-matches" aria-selected="false" tabindex="-1">Matches</button>
     <button class="tab" role="tab" id="tab-backup" data-tab="backup" aria-controls="panel-backup" aria-selected="false" tabindex="-1">Backup</button>
     <button class="tab" role="tab" id="tab-diagnostics" data-tab="diagnostics" aria-controls="panel-diagnostics" aria-selected="false" tabindex="-1">Diagnostics</button>
-    <button class="tab" role="tab" id="tab-about" data-tab="about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About / Info</button>
   </div>
 
   <section role="tabpanel" id="panel-general" aria-labelledby="tab-general">
@@ -70,6 +71,28 @@
   <small>The number of followed streamers who were live on Kick at the last check. It updates when a
     check finishes (first load, or ↻ in the popup), not on its own.</small>
 
+
+  <h2>Automatic refresh</h2>
+  <small>How often the extension refreshes by itself while Chrome is running. The two are independent. The ↻ button in the
+    popup works any time, whatever you pick here.</small>
+  <label for="autoRefreshMinutes">Followed streamers</label>
+  <select id="autoRefreshMinutes">
+    <option value="5">Every 5 minutes</option>
+    <option value="10">Every 10 minutes</option>
+    <option value="30">Every 30 minutes</option>
+    <option value="60">Every hour (default)</option>
+    <option value="0">Off: only when I press ↻</option>
+  </select>
+  <small>Looks for new follows (while your Twitch login is valid), refreshes live status for everyone on Kick, and checks
+    anyone not checked yet. Live status for 50 streamers is one request, so even 5 minutes is light.</small>
+  <label for="favoritesMinutes">Favorites</label>
+  <select id="favoritesMinutes">
+    <option value="5">Every 5 minutes</option>
+    <option value="10">Every 10 minutes</option>
+    <option value="30">Every 30 minutes</option>
+    <option value="60">Every hour (default)</option>
+  </select>
+  <small>Checks whether your favorites are live, and sends the “went live” notification. Shorter means you hear sooner.</small>
 
   <h2>Checking speed</h2>
   <label style="font-weight:400">Check up to
@@ -131,7 +154,7 @@
 
   <h2>Test a lookup</h2>
   <div class="row">
-    <input id="testLogin" placeholder="Twitch username, e.g. xqc">
+    <input id="testLogin" placeholder="Twitch username, e.g. summit1g">
     <button id="test">Test</button>
   </div>
   <pre id="out">—</pre>
@@ -140,7 +163,8 @@
   <section role="tabpanel" id="panel-favorites" aria-labelledby="tab-favorites" hidden>
   <h2>Favorites</h2>
   <small>Star up to 10 streamers in the popup. They stay at the top of the list, and their live status is
-    checked automatically every hour (and right when you star someone).</small>
+    checked automatically (every hour by default; change it under General → Automatic refresh) and right when you star
+    someone.</small>
   <label style="font-weight:400"><input id="notifyFavorites" type="checkbox" style="width:auto">
     Notify me when a favorite goes live on Kick</label>
   <div class="row" style="margin:6px 0 10px">
@@ -150,7 +174,7 @@
   </div>
   <small id="favSummary"></small>
   <div id="favList"></div>
-  <small>Hourly checks can't see a stream that starts and ends between two checks. Clicking a notification opens
+  <small>A check can't see a stream that starts and ends between two checks. Clicking a notification opens
     their Kick channel.</small>
   </section>
 
@@ -232,12 +256,17 @@
     <summary>What runs automatically</summary>
     <ul>
       <li><b>The first time</b> (nothing saved yet): it loads your follows and checks them all in the background.</li>
-      <li><b>Favorites:</b> checked every hour, and right after you star someone. One request covers all of them.</li>
+      <li><b>Followed streamers:</b> refreshed every hour by default (you can choose 5, 10 or 30 minutes, or off, in Settings →
+        General → Automatic refresh) while Chrome is running. It does what ↻ does: looks for new follows, refreshes live
+        status for everyone on Kick, and checks anyone not checked yet. New follows are picked up this way only while your
+        Twitch login is valid; otherwise press ↻ in the popup.</li>
+      <li><b>Favorites:</b> checked every hour by default (or every 5, 10 or 30 minutes), and right after you star someone.
+        One request covers all of them.</li>
       <li><b>An interrupted check</b> (Chrome restarted, the background worker was stopped) carries on by itself.</li>
       <li><b>Opening the popup</b> shows what's saved instantly and never starts a check. If the saved follow list is
         over an hour old it quietly refreshes the list from Twitch (a Twitch-only request).</li>
     </ul>
-    <p>Nothing else runs on its own. Live status otherwise changes only when you press ↻.</p>
+    <p>Nothing else runs on its own. Set followed streamers to “Off” and live status changes only when you press ↻.</p>
   </details>
 
   <details>
@@ -273,10 +302,10 @@
   <details>
     <summary>Favorites and notifications</summary>
     <p>Star up to 10 streamers (only those on Kick). They stay at the top of the list and their live status is checked
-      every hour. With notifications on (Settings → Favorites), you're told when a favorite goes live: one hourly check
-      saw them offline and the next sees them live. The first check after starring only notes their state, so starring
+      every hour by default, or as often as you choose. With notifications on (Settings → Favorites), you're told when a
+      favorite goes live: one check saw them offline and the next sees them live. The first check after starring only notes their state, so starring
       someone who is already live stays quiet. Clicking a notification opens their Kick channel.</p>
-    <p>A stream that starts and ends between two hourly checks can't be seen, and Chrome has to be running. Possible
+    <p>A stream that starts and ends between two checks can't be seen (a shorter interval helps), and Chrome has to be running. Possible
       impersonators are never tracked. The toolbar badge (Settings → General) shows how many followed streamers were live
       on Kick at the last check.</p>
   </details>
@@ -320,7 +349,7 @@
     <ul>
       <li>Kick has no public follow action, so “Kick ↗” opens their profile and you follow there.</li>
       <li>Matching is by name. Read the labels, and correct the ones we get wrong.</li>
-      <li>Hourly checks miss short streams. A plain ↻ can't see a follow plus an unfollow that cancel out (Shift+click can).</li>
+      <li>Automatic checks miss streams that start and end between two checks. A plain ↻ can't see a follow plus an unfollow that cancel out (Shift+click can).</li>
       <li>The Kick profile page isn't an official API and may change or be blocked.</li>
       <li>Kick's rate limits aren't published. The default pace is a safe guess that you can lower.</li>
     </ul>

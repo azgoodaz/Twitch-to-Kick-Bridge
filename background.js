@@ -852,7 +852,7 @@ async function noteRateLimit(err) {
 // Everything here can be re-fetched. Logins, credentials and settings are kept.
 const CACHE_KEYS = [
   "followsCache", "followCount", "scanState", "scanItems", "scanIndex", "scanLive", "scanTotal",
-  "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck",
+  "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck", "autoCheck",
 ];
 
 async function clearCache() {
@@ -882,11 +882,38 @@ const FAV_RETRY_ALARM = "kick-bridge-favs-retry";
 const MAX_FAVS = 10;
 let favCheckRunning = false;
 
+// ---------- How often things refresh by themselves (Settings > General > Automatic refresh) ----------
+// Two independent settings, same drop-down choices. Favorites always refresh; followed streamers can also be off (0).
+const REFRESH_CHOICES = [5, 10, 30, 60]; // minutes
+const DEFAULT_REFRESH_MIN = 60;
+const AUTO_ALARM = "kick-bridge-auto";
+const AUTO_FAILED_COOLDOWN = 30 * 60 * 1000; // the automatic refresh doesn't retry a failed lookup for 30 minutes
+
+function refreshChoice(v, { allowOff = false } = {}) {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  if (allowOff && n === 0) return 0;
+  return REFRESH_CHOICES.includes(n) ? n : DEFAULT_REFRESH_MIN;
+}
+const favoritesInterval = (v) => refreshChoice(v);
+const followedInterval = (v) => refreshChoice(v, { allowOff: true });
+
+// Keeps a repeating alarm in step with its setting: created when wanted, re-created only if the period changed.
+async function syncAlarm(name, minutes) {
+  const existing = await chrome.alarms.get(name);
+  if (!minutes) { if (existing) await chrome.alarms.clear(name); return; }
+  if (!existing || existing.periodInMinutes !== minutes) {
+    chrome.alarms.create(name, { delayInMinutes: minutes, periodInMinutes: minutes });
+  }
+}
+
 async function ensureFavAlarm() {
-  const { favorites = [] } = await chrome.storage.local.get("favorites");
-  const existing = await chrome.alarms.get(FAV_ALARM);
-  if (favorites.length && !existing) chrome.alarms.create(FAV_ALARM, { delayInMinutes: 60, periodInMinutes: 60 });
-  if (!favorites.length && existing) await chrome.alarms.clear(FAV_ALARM);
+  const { favorites = [], favoritesMinutes } = await chrome.storage.local.get(["favorites", "favoritesMinutes"]);
+  await syncAlarm(FAV_ALARM, favorites.length ? favoritesInterval(favoritesMinutes) : 0);
+}
+
+async function ensureAutoAlarm() {
+  const { autoRefreshMinutes } = await chrome.storage.local.get("autoRefreshMinutes");
+  await syncAlarm(AUTO_ALARM, followedInterval(autoRefreshMinutes));
 }
 
 async function checkFavorites(opts = {}) {
@@ -988,6 +1015,7 @@ async function testNotification() {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === FAV_ALARM) checkFavorites();
   else if (alarm.name === FAV_RETRY_ALARM) checkFavorites({ retry: true });
+  else if (alarm.name === AUTO_ALARM) autoRefresh();
 });
 
 // Starring someone: keep the alarm in sync and take their baseline right away.
@@ -1001,9 +1029,138 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (favorites.some((l) => !favState[l])) checkFavorites();
   }, 2000);
 });
+// Changing a drop-down re-times its alarm straight away.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes.favoritesMinutes) ensureFavAlarm();
+  if (changes.autoRefreshMinutes) ensureAutoAlarm();
+});
 chrome.runtime.onStartup.addListener(ensureFavAlarm);
 chrome.runtime.onInstalled.addListener(ensureFavAlarm);
+chrome.runtime.onStartup.addListener(ensureAutoAlarm);
+chrome.runtime.onInstalled.addListener(ensureAutoAlarm);
 ensureFavAlarm(); // and whenever the worker wakes up
+ensureAutoAlarm();
+
+// ---------- Automatic refresh of your followed streamers ----------
+// What pressing ↻ does, on a timer: look for new follows (while the Twitch login is valid), then refresh live
+// status for everyone on Kick and queue anything that was never checked. It never runs on top of a check that is
+// already going. (The popup's own copies of the follow-list code and the plan are tested to match these.)
+
+async function probeFollowCountBg(clientId, user) {
+  const url = new URL("https://api.twitch.tv/helix/channels/followed");
+  url.searchParams.set("user_id", user.userId);
+  url.searchParams.set("first", "1");
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${user.token}`, "Client-Id": clientId } });
+  if (!r.ok) throw Object.assign(new Error(`Twitch API error ${r.status}`), { code: r.status });
+  const j = await r.json();
+  return typeof j.total === "number" ? j.total : null;
+}
+
+async function fetchFollowsBg(clientId, user) {
+  const headers = { Authorization: `Bearer ${user.token}`, "Client-Id": clientId };
+  const fail = (r) => Object.assign(new Error(`Twitch API error ${r.status}`), { code: r.status });
+  const ids = [];
+  let after = null;
+  let total = null;
+  do {
+    const url = new URL("https://api.twitch.tv/helix/channels/followed");
+    url.searchParams.set("user_id", user.userId);
+    url.searchParams.set("first", "100");
+    if (after) url.searchParams.set("after", after);
+    const r = await fetch(url, { headers });
+    if (!r.ok) throw fail(r);
+    const j = await r.json();
+    if (total === null && typeof j.total === "number") total = j.total;
+    for (const d of j.data) ids.push(d.broadcaster_id);
+    after = j.pagination?.cursor || null;
+  } while (after);
+
+  const list = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const url = new URL("https://api.twitch.tv/helix/users");
+    for (const id of ids.slice(i, i + 100)) url.searchParams.append("id", id);
+    const r = await fetch(url, { headers });
+    if (!r.ok) throw fail(r);
+    for (const u of (await r.json()).data) {
+      list.push({ login: u.login, name: u.display_name, bio: u.description || "", img: u.profile_image_url, type: u.broadcaster_type || "" });
+    }
+  }
+  list.sort((a, b) => a.name.localeCompare(b.name));
+  await chrome.storage.local.set({
+    followsCache: { at: Date.now(), userId: user.userId, list },
+    followCount: typeof total === "number" ? total : ids.length, // saved with the list, so they can't disagree
+  });
+  return list;
+}
+
+// Same rules as the popup's manual ↻ (planFor "manual"), except a failed lookup waits 30 minutes before a retry,
+// so a refresh every few minutes can't keep hammering a channel that errors.
+function planAutoRefresh(list, stored, now) {
+  const full = [], live = [];
+  for (const f of list) {
+    const e = stored[`kc:${f.login}`];
+    if (!e) { full.push({ login: f.login, force: false }); continue; }
+    const v = e.value || {};
+    if (v.failed) { if (now - e.at > AUTO_FAILED_COOLDOWN) full.push({ login: f.login, force: true }); continue; }
+    if (!v.kickSlug) { if (now - e.at > MISS_TTL) full.push({ login: f.login, force: true }); continue; }
+    if (!v.kickUserId || !v.profileTriedAt) { full.push({ login: f.login, force: true }); continue; }
+    live.push({ login: f.login, userId: v.kickUserId });
+  }
+  // streamers whose Twitch bio mentions kick.com are certain hits: first in line (same as the popup)
+  const bio = new Map(list.map((f) => [f.login, f.bio || ""]));
+  const mentions = (x) => (/kick\.com/i.test(bio.get(x.login) || "") ? 0 : 1);
+  full.sort((a, b) => mentions(a) - mentions(b));
+  return { full, live };
+}
+
+let autoRefreshRunning = false;
+
+async function autoRefresh() {
+  if (autoRefreshRunning || activeScan) return { skipped: "busy" };
+  autoRefreshRunning = true;
+  const note = { ran: false, lastAt: Date.now(), error: null, followsChanged: false, queued: 0 };
+  try {
+    const c = await getCreds();
+    if (!c.kickId || !c.kickSecret) return { skipped: "no Kick credentials" };
+    const s = await chrome.storage.local.get(["followsCache", "followCount", "twitchId", "twitchUser"]);
+    if (!s.followsCache?.list) return { skipped: "nothing loaded yet" }; // the first load happens when you open the popup
+    note.ran = true;
+    let list = s.followsCache.list;
+
+    // 1) did you follow or unfollow anyone? (needs a valid Twitch login; otherwise the saved list is used)
+    const user = s.twitchUser;
+    if (s.twitchId && user && user.exp > Date.now() + 60_000 && user.userId === s.followsCache.userId) {
+      try {
+        const before = typeof s.followCount === "number" ? s.followCount : null;
+        const total = before === null ? null : await probeFollowCountBg(s.twitchId, user);
+        if (before === null || total === null || total !== before) {
+          list = await fetchFollowsBg(s.twitchId, user);
+          note.followsChanged = true;
+        }
+      } catch (e) {
+        note.error = String(e.message || e).slice(0, 200);
+        if (e.code === 401) await chrome.storage.local.set({ twitchUser: { ...user, exp: 0 } }); // rejected: the popup will ask you to reconnect
+        else await recordError("Auto refresh (follows)", e);
+      }
+    }
+
+    // 2) refresh live status + queue the unchecked
+    const stored = await chrome.storage.local.get(list.map((f) => `kc:${f.login}`));
+    const { full, live } = planAutoRefresh(list, stored, Date.now());
+    note.queued = full.length + live.length;
+    if (note.queued) await startScan({ full, live });
+    return { checked: list.length, queued: note.queued, followsChanged: note.followsChanged };
+  } catch (e) {
+    note.error = String(e.message || e).slice(0, 200);
+    if (isRateLimit(e)) await noteRateLimit(e);
+    else await recordError("Auto refresh", e);
+    return { error: note.error };
+  } finally {
+    autoRefreshRunning = false;
+    if (note.ran) await chrome.storage.local.set({ autoCheck: note });
+  }
+}
 
 // ---------- Your corrections ("not them" / "it's them") ----------
 // storage.kickOverrides = { login: "yes" | "not" }. They survive Clear cache: they're
@@ -1038,6 +1195,8 @@ const own = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key); // `in
 const BACKUP_SETTINGS = {
   minimal: { type: "bool" }, showBadge: { type: "bool" }, notifyFavorites: { type: "bool" }, liveOnly: { type: "bool" },
   rateBatch: { type: "int", min: 10, max: 1000 }, rateMinutes: { type: "int", min: 1, max: 60 },
+  favoritesMinutes: { type: "enum", values: [5, 10, 30, 60] },
+  autoRefreshMinutes: { type: "enum", values: [0, 5, 10, 30, 60] }, // 0 = off
 };
 const validLogin = (login) => LOGIN_RE.test(login) && login !== "__proto__"; // "__proto__" can't be stored as a key
 
@@ -1115,7 +1274,9 @@ async function importBackup(data, { dryRun = false } = {}) {
         const rule = own(BACKUP_SETTINGS, key) ? BACKUP_SETTINGS[key] : null;
         const ok = rule && (rule.type === "bool"
           ? typeof value === "boolean"
-          : Number.isInteger(value) && value >= rule.min && value <= rule.max);
+          : rule.type === "enum"
+            ? rule.values.includes(value)
+            : Number.isInteger(value) && value >= rule.min && value <= rule.max);
         if (ok) { update[key] = value; applied++; } else out.settingsSkipped++;
       }
       out.settingsRestored = applied;

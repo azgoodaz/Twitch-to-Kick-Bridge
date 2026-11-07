@@ -62,7 +62,7 @@ function clock(ms) {
 
 // What to show under "Checking speed": a live countdown to the next batch while a check runs, or to the next
 // automatic refresh (your favorites' hourly check) when nothing is running.
-function nextRefreshView({ scan, favorites, favNextAt, now }) {
+function nextRefreshView({ scan, favorites, favNextAt, autoNextAt, now }) {
   const ss = scan || {};
   const alive = ss.running && now - (ss.heartbeat || 0) < 20_000;
   if (alive) {
@@ -86,20 +86,26 @@ function nextRefreshView({ scan, favorites, favNextAt, now }) {
     };
   }
   const last = ss.finishedAt ? `Last check finished ${ago(now - ss.finishedAt)}. ` : "";
-  if ((favorites || []).length && favNextAt && favNextAt > now) {
-    return { tone: "", fraction: null, headline: `Next automatic refresh in ${clock(favNextAt - now)}`,
-      sub: `${last}That's your favorites' hourly check. Everything else refreshes when you press ↻ in the popup.` };
+  // two independent automatic refreshes: followed streamers, and favorites
+  const upcoming = [];
+  if (autoNextAt && autoNextAt > now) upcoming.push({ label: "Followed streamers", at: autoNextAt });
+  if ((favorites || []).length && favNextAt && favNextAt > now) upcoming.push({ label: "Favorites", at: favNextAt });
+  upcoming.sort((a, b) => a.at - b.at);
+  if (upcoming.length) {
+    return { tone: "", fraction: null, headline: `Next automatic refresh in ${clock(upcoming[0].at - now)}`,
+      sub: `${last}${upcoming.map((u) => `${u.label} in ${clock(u.at - now)}`).join(" · ")}. You can also press ↻ in the popup any time.` };
   }
   return { tone: "", fraction: null, headline: "No refresh scheduled",
-    sub: `${last}Press ↻ in the popup to check your follows. Favorites are checked every hour once you star someone.` };
+    sub: `${last}Press ↻ in the popup to check your follows. Choose how often it happens by itself under Automatic refresh above.` };
 }
 // ==== next-pure-end
 
 async function renderNextRefresh() {
   if (document.getElementById("panel-general").hidden) return; // only while you're looking at it
   const s = await chrome.storage.local.get(["scanState", "favorites"]);
-  const alarm = await chrome.alarms.get("kick-bridge-favs");
-  const v = nextRefreshView({ scan: s.scanState, favorites: s.favorites, favNextAt: alarm?.scheduledTime, now: Date.now() });
+  const favAlarm = await chrome.alarms.get("kick-bridge-favs");
+  const autoAlarm = await chrome.alarms.get("kick-bridge-auto");
+  const v = nextRefreshView({ scan: s.scanState, favorites: s.favorites, favNextAt: favAlarm?.scheduledTime, autoNextAt: autoAlarm?.scheduledTime, now: Date.now() });
   $("nextHeadline").textContent = v.headline;
   $("nextSub").textContent = v.sub;
   $("nextBox").classList.toggle("warn", v.tone === "warn");
@@ -194,6 +200,12 @@ renderConnections();
 
 // ---------- Diagnostics ----------
 // ==== diagnostics-pure-start (no chrome.* calls in here, so it can be tested)
+// Drop-down choices for Settings > General > Automatic refresh (same as the worker's REFRESH_CHOICES).
+// Followed streamers can also be off (0).
+const REFRESH_CHOICES = { autoRefreshMinutes: [0, 5, 10, 30, 60], favoritesMinutes: [5, 10, 30, 60] };
+const REFRESH_DEFAULT = 60;
+const refreshValue = (id, stored) => (REFRESH_CHOICES[id].includes(stored) ? stored : REFRESH_DEFAULT);
+const intervalText = (m) => (m === 0 ? "off" : m === 60 ? "every hour" : `every ${m} min`);
 // Same small function as in background.js / popup.js / content.js: keep in sync.
 function effectiveTier(v, override) {
   if (override === "not") return "none";
@@ -260,6 +272,11 @@ function buildDiagnostics(all, total, now, quota, extra = {}) { // extra: { favN
   } else {
     add("Rate limit", "None recorded", "ok");
   }
+  const ac = all.autoCheck;
+  add("Auto refresh",
+    `Followed streamers: ${intervalText(refreshValue("autoRefreshMinutes", all.autoRefreshMinutes))} · Favorites: ${intervalText(refreshValue("favoritesMinutes", all.favoritesMinutes))}` +
+      (ac?.lastAt ? `. Last ran ${ago(now - ac.lastAt)}${ac.followsChanged ? ", found follow changes" : ""}${ac.queued ? `, queued ${ac.queued}` : ""}${ac.error ? `. Problem: ${ac.error}` : ""}` : ""),
+    ac?.error ? "warn" : "ok");
   add("Pace", `${batch} streamers every ${minutes} min (one every ${((minutes * 60) / batch).toFixed(1)}s)`);
   const left = (all.scanItems || []).length - (all.scanIndex || 0);
   if (alive) {
@@ -597,7 +614,7 @@ renderOverrides();
 
 // ---------- Backup ----------
 // ==== backup-pure-start (no chrome.* calls in here, so it can be tested)
-const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "rateBatch", "rateMinutes"];
+const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "rateBatch", "rateMinutes", "favoritesMinutes", "autoRefreshMinutes"];
 const BACKUP_KEYS = ["kickOverrides", "favorites", ...BACKUP_SETTING_KEYS];
 
 // What goes into the file: corrections, favorites, and display/speed/notification settings.
@@ -708,6 +725,17 @@ $("importFile").addEventListener("change", async (e) => {
   const res = await chrome.runtime.sendMessage({ type: "IMPORT_BACKUP", data });
   backupMessage(res?.error ? `Import failed: ${res.error}` : doneText(res));
 });
+
+// ---------- Automatic refresh drop-downs ----------
+chrome.storage.local.get(Object.keys(REFRESH_CHOICES)).then((s) => {
+  for (const id of Object.keys(REFRESH_CHOICES)) $(id).value = String(refreshValue(id, s[id]));
+});
+for (const id of Object.keys(REFRESH_CHOICES)) {
+  $(id).addEventListener("change", (e) => {
+    const v = Number(e.target.value);
+    if (REFRESH_CHOICES[id].includes(v)) chrome.storage.local.set({ [id]: v }); // the worker re-times its alarm at once
+  });
+}
 
 $("aboutVersion").textContent = chrome.runtime.getManifest().version;
 
