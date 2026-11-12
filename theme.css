@@ -1,0 +1,71 @@
+/* Colours for the popup and the settings page, in light and dark.
+   theme.js sets <html data-theme="light|dark"> before the first paint. Kick green (#53fc18) is used sparingly:
+   the active tab, progress bar, focus ring, a faint glow at the top, and a hairline under the popup header. */
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --surface: #ffffff;          /* inputs, cards */
+  --raised: #f4f4f5;           /* code blocks, hover */
+  --btn2: #efeff1;             /* secondary buttons */
+  --border: #e4e4e7;
+  --border-soft: #f0f0f2;
+  --input-border: #d4d4d8;
+  --text: #1f1f23;
+  --text-strong: #3f3f46;
+  --muted: #5c5c66;
+  --link: #2563eb;
+  --focus: #2563eb;
+  --star-off: #8a8a94;
+  --star-on: #d97706;          /* darker amber: stays visible on white */
+  --placeholder: #e4e4e7;      /* the grey circle shown until a picture arrives */
+  --fav-bg: #fffbea;
+  --suspect-bg: #fff1e0;
+  --suspect-ink: #b45309;
+  --warn-ink: #b45309;
+  --live-ink: #c0211f;
+  --accent: #53fc18;           /* Kick green */
+  --accent-ink: #0b0e0f;       /* text on the green */
+  --accent-line: rgba(83, 252, 24, 0);
+  --glow: rgba(83, 252, 24, 0);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0d110e;
+  --surface: #131914;
+  --raised: #1a211b;
+  --btn2: #1f2820;
+  --border: #26312a;
+  --border-soft: #1b231d;
+  --input-border: #34423a;
+  --text: #e7eee9;
+  --text-strong: #cfdad2;
+  --muted: #98a69d;
+  --link: #8db4ff;
+  --focus: #53fc18;
+  --star-off: #6b7a70;
+  --star-on: #f5a623;
+  --placeholder: #232d26;
+  --fav-bg: rgba(245, 166, 35, 0.10);
+  --suspect-bg: rgba(255, 140, 0, 0.13);
+  --suspect-ink: #ffb454;
+  --warn-ink: #ffb454;
+  --live-ink: #ff7a74;
+  --accent-line: rgba(83, 252, 24, 0.28);
+  --glow: rgba(83, 252, 24, 0.07);
+}
+
+html { background: var(--bg); }
+body { background: radial-gradient(120% 70% at 50% -15%, var(--glow), transparent 62%) no-repeat var(--bg); color: var(--text); }
+::selection { background: rgba(83, 252, 24, 0.35); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+:root[data-theme="dark"] input[type="checkbox"] { accent-color: var(--accent); }
+
+/* the sun / moon button (popup header and settings page) */
+.theme-btn { display: inline-flex; align-items: center; justify-content: center; margin: 0; padding: 5px; background: none; border: 0;
+  border-radius: 6px; color: var(--muted); cursor: pointer; }
+.theme-btn:hover { color: var(--text); background: var(--raised); }
+.theme-btn .sun { display: none; }
+.theme-btn .moon { display: block; }
+:root[data-theme="dark"] .theme-btn .sun { display: block; }
+:root[data-theme="dark"] .theme-btn .moon { display: none; }

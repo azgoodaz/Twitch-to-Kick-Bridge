@@ -3,16 +3,20 @@
 <head>
   <meta charset="utf-8">
   <title>Twitch → Kick Bridge</title>
+  <link rel="stylesheet" href="theme.css">
+  <script src="theme.js"></script>
   <style>
-    body { width: 380px; margin: 0; font: 13px/1.4 system-ui, sans-serif; color: #1f1f23; }
-    header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid #e4e4e7; }
+    body { width: 380px; margin: 0; font: 13px/1.4 system-ui, sans-serif; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); box-shadow: inset 0 -1px 0 var(--accent-line); }
     header strong { font-size: 14px; }
-    header a { color: #5c5c66; cursor: pointer; margin-left: 10px; font-size: 12px; text-decoration: underline; }
+    .hdr-right { display: flex; align-items: center; }
+    header a { color: var(--muted); cursor: pointer; margin-left: 10px; font-size: 12px; text-decoration: underline; }
+    header a:hover { color: var(--text); }
     #connect, #message { padding: 16px 12px; }
-    button { padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; border: 0; border-radius: 6px; background: #9146ff; color: #fff; }
-    #bar { padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; align-items: center; color: #5c5c66; font-size: 12px; }
+    button { padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; border: 0; border-radius: 6px; background: #9146ff; color: #fff; } /* Twitch purple */
+    #bar { padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; justify-content: space-between; align-items: center; color: var(--muted); font-size: 12px; }
     .opts { display: flex; gap: 12px; align-items: center; }
-    #refresh { display: inline-flex; align-items: center; padding: 4px 8px; background: #efeff1; color: #1f1f23; }
+    #refresh { display: inline-flex; align-items: center; padding: 4px 8px; background: var(--btn2); color: var(--text); }
     #refresh .ico { display: block; }
     /* spins while a check is running; freezes while waiting out a rate limit */
     #refresh.spinning .ico { animation: kb-spin 0.9s linear infinite; }
@@ -21,31 +25,31 @@
     @keyframes kb-pulse { 50% { opacity: .35; } }
     @media (prefers-reduced-motion: reduce) { #refresh.spinning .ico { animation: kb-pulse 1.2s ease-in-out infinite; } }
     #rows { list-style: none; margin: 0; padding: 0; max-height: 460px; overflow-y: auto; }
-    .row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-top: 1px solid #f0f0f2; }
-    .row img { border-radius: 50%; flex: none; background: #e4e4e7; } /* the grey circle shown until the picture arrives */
+    .row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-top: 1px solid var(--border-soft); }
+    .row img { border-radius: 50%; flex: none; background: var(--placeholder); } /* the grey circle shown until the picture arrives */
     .mid { flex: 1; min-width: 0; display: flex; flex-direction: column; }
     .mid .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .mid .sub { color: #5c5c66; font-size: 12px; }
-    .row.live .sub { color: #c0211f; }
-    .go { flex: none; padding: 5px 10px; border-radius: 6px; background: #53fc18; color: #0b0e0f; font-weight: 600; text-decoration: none; }
+    .mid .sub { color: var(--muted); font-size: 12px; }
+    .row.live .sub { color: var(--live-ink); }
+    .go { flex: none; padding: 5px 10px; border-radius: 6px; background: var(--accent); color: var(--accent-ink); font-weight: 600; text-decoration: none; }
     .row.nokick { display: none; }
     #rows.liveOnly .row:not(.live) { display: none !important; }
     #rows.showAll .row.nokick { display: flex; opacity: .55; }
     #searchWrap { padding: 8px 12px 0; }
-    #search { width: 100%; box-sizing: border-box; padding: 7px 9px; font: inherit; border: 1px solid #d4d4d8; border-radius: 6px; }
-    #noMatch { padding: 20px 14px; color: #5c5c66; text-align: center; }
-    #emptyText { font-weight: 600; color: #3f3f46; }
+    #search { width: 100%; box-sizing: border-box; padding: 7px 9px; font: inherit; background: var(--surface); color: var(--text); border: 1px solid var(--input-border); border-radius: 6px; }
+    #noMatch { padding: 20px 14px; color: var(--muted); text-align: center; }
+    #emptyText { font-weight: 600; color: var(--text-strong); }
     #emptyHint { display: block; margin-top: 3px; font-size: 12px; }
     #emptyAction { margin-top: 8px; font-size: 12px; }
     .row.nomatch { display: none !important; }
-    .row.fav { background: #fffbea; }
-    .row.suspect { background: #fff1e0; }
-    .row.suspect .sub { color: #b45309; font-weight: 600; }
+    .row.fav { background: var(--fav-bg); }
+    .row.suspect { background: var(--suspect-bg); }
+    .row.suspect .sub { color: var(--suspect-ink); font-weight: 600; }
     .acts { display: flex; gap: 12px; margin-top: 2px; }
-    .act { background: none; border: 0; padding: 0; color: #2563eb; font-size: 11px; font-weight: 400; text-decoration: underline; cursor: pointer; }
-    .star { flex: none; background: none; color: #b4b4bb; border: 0; padding: 0 2px; font-size: 19px; line-height: 1; cursor: pointer; }
-    .star:hover { color: #f5a623; }
-    .star.on { color: #f5a623; }
+    .act { background: none; border: 0; padding: 0; color: var(--link); font-size: 11px; font-weight: 400; text-decoration: underline; cursor: pointer; }
+    .star { flex: none; background: none; color: var(--star-off); border: 0; padding: 0 2px; font-size: 19px; line-height: 1; cursor: pointer; }
+    .star:hover { color: var(--star-on); }
+    .star.on { color: var(--star-on); }
     /* while searching, also show streamers who aren't on Kick (dimmed) so you can see "not on Kick" */
     #rows.searching .row.nokick { display: flex; opacity: .55; }
     [hidden] { display: none !important; }
@@ -54,7 +58,7 @@
 <body>
   <header>
     <strong>Followed → Kick</strong>
-    <span><a id="settings">Settings</a><a id="disconnect" hidden>Disconnect</a></span>
+    <span class="hdr-right"><button type="button" class="theme-btn" data-theme-toggle title="Switch to dark mode" aria-label="Switch to dark mode"><svg class="sun" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="moon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button><a id="settings">Settings</a><a id="disconnect" hidden>Disconnect</a></span>
   </header>
 
   <div id="message" hidden></div>

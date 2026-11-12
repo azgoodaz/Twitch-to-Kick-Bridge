@@ -614,7 +614,7 @@ renderOverrides();
 
 // ---------- Backup ----------
 // ==== backup-pure-start (no chrome.* calls in here, so it can be tested)
-const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "rateBatch", "rateMinutes", "favoritesMinutes", "autoRefreshMinutes"];
+const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "rateBatch", "rateMinutes", "themeFollowSystem", "theme", "favoritesMinutes", "autoRefreshMinutes"];
 const BACKUP_KEYS = ["kickOverrides", "favorites", ...BACKUP_SETTING_KEYS];
 
 // What goes into the file: corrections, favorites, and display/speed/notification settings.

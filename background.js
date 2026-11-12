@@ -1195,6 +1195,7 @@ const own = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key); // `in
 const BACKUP_SETTINGS = {
   minimal: { type: "bool" }, showBadge: { type: "bool" }, notifyFavorites: { type: "bool" }, liveOnly: { type: "bool" },
   rateBatch: { type: "int", min: 10, max: 1000 }, rateMinutes: { type: "int", min: 1, max: 60 },
+  themeFollowSystem: { type: "bool" }, theme: { type: "enum", values: ["light", "dark"] },
   favoritesMinutes: { type: "enum", values: [5, 10, 30, 60] },
   autoRefreshMinutes: { type: "enum", values: [0, 5, 10, 30, 60] }, // 0 = off
 };
