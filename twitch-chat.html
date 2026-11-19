@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Twitch chat</title>
+  <link rel="stylesheet" href="twitch-chat.css">
+</head>
+<body>
+  <div id="title" class="title" hidden></div>
+  <div id="status" class="status" role="status"></div>
+  <div class="logwrap">
+    <div id="log" class="log" role="log" aria-live="polite"></div>
+    <button id="jump" class="jump" type="button" hidden>New messages ↓</button>
+  </div>
+  <div id="login" class="login" hidden>
+    <span id="loginText"></span>
+    <button id="loginBtn" type="button">Allow Twitch chat</button>
+  </div>
+  <form id="form" class="form" autocomplete="off">
+    <input id="input" type="text" maxlength="500" placeholder="Send a message" aria-label="Send a message">
+    <button id="send" type="submit">Chat</button>
+  </form>
+  <script src="twitch-chat.js"></script>
+</body>
+</html>

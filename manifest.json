@@ -31,6 +31,16 @@
         "content.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://kick.com/*",
+        "https://www.kick.com/*"
+      ],
+      "js": [
+        "kick-content.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "options_ui": {
@@ -50,5 +60,16 @@
     "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "twitch-chat.html"
+      ],
+      "matches": [
+        "https://kick.com/*",
+        "https://www.kick.com/*"
+      ]
+    }
+  ]
 }

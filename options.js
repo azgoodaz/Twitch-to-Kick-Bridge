@@ -142,6 +142,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.followsCache) renderSpeedEstimate();
 });
 
+// Show Twitch Chat on Kick pages: saved immediately; open Kick tabs react at once.
+chrome.storage.local.get("showTwitchChat").then((s) => ($("showTwitchChat").checked = Boolean(s.showTwitchChat)));
+$("showTwitchChat").addEventListener("change", (e) => chrome.storage.local.set({ showTwitchChat: e.target.checked }));
+
 // Toolbar badge: saved immediately; the background worker reacts to the change.
 chrome.storage.local.get("showBadge").then((s) => ($("showBadge").checked = Boolean(s.showBadge)));
 $("showBadge").addEventListener("change", (e) => chrome.storage.local.set({ showBadge: e.target.checked }));
@@ -164,16 +168,26 @@ async function renderConnections() {
   $("twitchConnect").textContent = t ? "Reconnect" : "Connect";
   $("twitchLogout").hidden = !t;
 
+  // chat permission (read + send Twitch chat): granted separately, only when you opt in
+  const hasChat = Boolean(t?.scopes?.includes("chat:read") && t?.scopes?.includes("chat:edit"));
+  $("chatPermState").textContent = !t ? "Connect Twitch first"
+    : hasChat ? `Allowed: read and send chat messages as ${t.login}`
+    : "Not allowed yet. Needed to read and send messages in Twitch chat on Kick pages";
+  $("chatPermBtn").textContent = hasChat ? "Re-allow" : "Allow Twitch chat";
+  $("chatPermNote").textContent = !t ? "Twitch chat permission: connect Twitch first (Connections tab)."
+    : hasChat ? "Twitch chat permission: allowed." : "Twitch chat permission: not allowed yet, so chat will be read-only.";
+  $("chatPermAllow").hidden = !t || hasChat;
+
   $("kickState").textContent = k ? `Connected as ${k.name || "your Kick account"}` : "Not connected";
   $("kickConnect").textContent = k ? "Reconnect" : "Connect";
   $("kickLogout").hidden = !k;
 }
 
-async function runConnection(type, doing) {
+async function runConnection(type, doing, extra = {}) {
   const buttons = document.querySelectorAll(".btns button");
   $("connMsg").textContent = doing;
   buttons.forEach((b) => (b.disabled = true));
-  const res = await chrome.runtime.sendMessage({ type });
+  const res = await chrome.runtime.sendMessage({ type, ...extra });
   buttons.forEach((b) => (b.disabled = false));
 
   if (res?.error) {
@@ -188,6 +202,9 @@ async function runConnection(type, doing) {
 }
 
 $("twitchConnect").addEventListener("click", () => runConnection("TWITCH_LOGIN", "Opening Twitch login…"));
+for (const id of ["chatPermBtn", "chatPermAllow"]) {
+  $(id).addEventListener("click", () => runConnection("TWITCH_LOGIN", "Opening Twitch login…", { chat: true }));
+}
 $("twitchLogout").addEventListener("click", () => runConnection("TWITCH_LOGOUT", "Logging out of Twitch…"));
 $("kickConnect").addEventListener("click", () => runConnection("KICK_LOGIN", "Opening Kick login…"));
 $("kickLogout").addEventListener("click", () => runConnection("KICK_LOGOUT", "Logging out of Kick…"));
@@ -338,6 +355,16 @@ function buildDiagnostics(all, total, now, quota, extra = {}) { // extra: { favN
     ? `${fc.list.length} follows${typeof fcount === "number" && fcount !== fc.list.length ? ` (Twitch counts ${fcount}; the difference has no profile, e.g. deleted or banned)` : ""}, saved ${ago(now - fc.at)} (~${fmtBytes(bytesOf(fc))})`
     : "Not loaded yet");
   add("Pictures", extra.avatarCount ? `${extra.avatarCount} thumbnails saved (so they load without the network)` : "None saved yet. They're saved as you scroll");
+  const det = all.kickChatDetect;
+  const how = !all.showTwitchChat ? { text: "Off (turn on under Settings → General → Display)", status: "" }
+    : !det ? { text: "No Kick channel page seen yet. Open one (and reload the page after updating the extension)", status: "" }
+    : !det.inIndex ? { text: `kick.com/${det.slug}: not matched to a streamer you follow on Twitch, so no Twitch chat (seen ${ago(now - det.at)})`, status: "" }
+    : det.mode === "docked" ? { text: `kick.com/${det.slug}: docked over Kick's chat (seen ${ago(now - det.at)})`, status: "" }
+    : det.mode === "floating" ? { text: `kick.com/${det.slug}: floating panel, couldn't find Kick's chat column. Kick's layout may have changed (seen ${ago(now - det.at)})`, status: "warn" }
+    : { text: `kick.com/${det.slug}: matched, still looking for Kick's chat (seen ${ago(now - det.at)})`, status: "" };
+  add("Twitch chat on Kick", how.text, how.status);
+  const chatChannels = Object.keys(all.kickIndex || {}).length;
+  add("Twitch chat index", chatChannels ? `${chatChannels} Kick channels can show Twitch chat` : "Empty (built from your matches after a check)");
   if (typeof fcount === "number") add("Follow count", `${fcount}. The refresh button compares Twitch's current number with this one`);
   add("Storage", `${fmtBytes(total)} used of ${fmtBytes(quota)}`, total > quota * 0.8 ? "warn" : "");
 
@@ -614,7 +641,7 @@ renderOverrides();
 
 // ---------- Backup ----------
 // ==== backup-pure-start (no chrome.* calls in here, so it can be tested)
-const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "rateBatch", "rateMinutes", "themeFollowSystem", "theme", "favoritesMinutes", "autoRefreshMinutes"];
+const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "showTwitchChat", "rateBatch", "rateMinutes", "themeFollowSystem", "theme", "favoritesMinutes", "autoRefreshMinutes"];
 const BACKUP_KEYS = ["kickOverrides", "favorites", ...BACKUP_SETTING_KEYS];
 
 // What goes into the file: corrections, favorites, and display/speed/notification settings.

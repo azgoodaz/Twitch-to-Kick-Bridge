@@ -8,7 +8,8 @@ const cache = new Map(); // login -> { at, value }
 const HANDLERS = {
   LOOKUP: (m) => lookup(m.login),               // content script (single channel)
   START_SCAN: (m) => startScan(m),               // popup: first load or the refresh button
-  TWITCH_LOGIN: () => twitchLogin(),             // popup / settings: connect Twitch
+  TWITCH_LOGIN: (m) => twitchLogin({ chat: Boolean(m && m.chat) }), // popup / settings / chat page: connect Twitch (chat: also ask to read+send chat)
+  OPEN_CHAT_WINDOW: (m) => openChatWindow(m.login),                 // Kick page: "Pop out" the Twitch chat
   TWITCH_LOGOUT: () => twitchLogout(),           // settings / popup: log out of Twitch
   KICK_LOGIN: () => kickLogin(),                 // settings: connect Kick
   KICK_LOGOUT: () => kickLogout(),               // settings: log out of Kick
@@ -326,9 +327,17 @@ function kickSlugGuess(login) {
 // Implicit grant via chrome.identity. Requires the redirect URL shown on the
 // options page to be added to your Twitch app's "OAuth Redirect URLs".
 
-async function twitchLogin() {
+// Reading who you follow is all the login needs. Chat (shown on Kick pages when "Show Twitch Chat" is on) needs two more
+// permissions, asked for only when you choose to allow it. Once granted they're kept on later logins, so reconnecting
+// from the popup can't quietly drop them.
+const CHAT_SCOPES = ["chat:read", "chat:edit"];
+
+async function twitchLogin({ chat = false } = {}) {
   const c = await getCreds();
   if (!c.twitchId) throw new Error("Add your Twitch Client ID in settings first.");
+  const { twitchUser: prev } = await chrome.storage.local.get("twitchUser");
+  const hadChat = CHAT_SCOPES.every((s) => prev?.scopes?.includes(s));
+  const scopes = ["user:read:follows", ...(chat || hadChat ? CHAT_SCOPES : [])];
 
   const state = crypto.randomUUID();
   const authUrl =
@@ -337,7 +346,7 @@ async function twitchLogin() {
       client_id: c.twitchId,
       redirect_uri: chrome.identity.getRedirectURL(),
       response_type: "token",
-      scope: "user:read:follows",
+      scope: scopes.join(" "),
       state,
     });
 
@@ -360,6 +369,7 @@ async function twitchLogin() {
       userId: info.user_id,
       login: info.login,
       exp: Date.now() + info.expires_in * 1000,
+      scopes: Array.isArray(info.scopes) ? info.scopes : scopes, // what Twitch actually granted
     },
   });
   return { login: info.login };
@@ -852,7 +862,7 @@ async function noteRateLimit(err) {
 // Everything here can be re-fetched. Logins, credentials and settings are kept.
 const CACHE_KEYS = [
   "followsCache", "followCount", "scanState", "scanItems", "scanIndex", "scanLive", "scanTotal",
-  "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck", "autoCheck",
+  "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck", "autoCheck", "kickIndex", "kickChatDetect",
 ];
 
 async function clearCache() {
@@ -1193,7 +1203,7 @@ const LOGIN_RE = /^[a-z0-9_]{1,25}$/;
 const MAX_IMPORT = 5000;
 const own = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key); // `in` would also match "constructor", "toString"...
 const BACKUP_SETTINGS = {
-  minimal: { type: "bool" }, showBadge: { type: "bool" }, notifyFavorites: { type: "bool" }, liveOnly: { type: "bool" },
+  minimal: { type: "bool" }, showBadge: { type: "bool" }, notifyFavorites: { type: "bool" }, liveOnly: { type: "bool" }, showTwitchChat: { type: "bool" },
   rateBatch: { type: "int", min: 10, max: 1000 }, rateMinutes: { type: "int", min: 1, max: 60 },
   themeFollowSystem: { type: "bool" }, theme: { type: "enum", values: ["light", "dark"] },
   favoritesMinutes: { type: "enum", values: [5, 10, 30, 60] },
@@ -1286,4 +1296,54 @@ async function importBackup(data, { dryRun = false } = {}) {
 
   if (!dryRun) await chrome.storage.local.set(update);
   return out;
+}
+
+// ---------- Kick channel -> Twitch streamer (for "Show Twitch Chat" on Kick pages) ----------
+// Matches are saved the other way round (Twitch login -> Kick channel), but a Kick page only knows its own
+// channel name. So keep a small index, Kick slug -> { l: Twitch login, n: display name, t: confidence }, for the
+// content script on kick.com to read in one go (instead of every saved lookup). Possible impersonators and
+// matches you marked "not them" are left out, so they never get a Twitch chat tab.
+async function rebuildKickIndex() {
+  try {
+    const { followsCache, kickOverrides = {} } = await chrome.storage.local.get(["followsCache", "kickOverrides"]);
+    const list = followsCache?.list || [];
+    const stored = await chrome.storage.local.get(list.map((f) => `kc:${f.login}`));
+    const index = {};
+    for (const f of list) {
+      const v = stored[`kc:${f.login}`]?.value;
+      if (!v?.kickSlug) continue;
+      const t = effectiveTier(v, kickOverrides[f.login]);
+      if (t === "suspected" || t === "none") continue;
+      index[String(v.kickSlug).toLowerCase()] = { l: f.login, n: f.name || f.login, t };
+    }
+    await chrome.storage.local.set({ kickIndex: index });
+  } catch (e) {
+    console.debug("[Kick Bridge] index rebuild failed", e);
+  }
+}
+
+// A check writes many entries: rebuild once things go quiet.
+let kickIndexTimer = null;
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (!Object.keys(changes).some((k) => k.startsWith("kc:") || k === "followsCache" || k === "kickOverrides")) return;
+  clearTimeout(kickIndexTimer);
+  kickIndexTimer = setTimeout(rebuildKickIndex, 2000);
+});
+
+// Existing installs already have saved matches: build the index once if it's missing.
+(async () => {
+  const s = await chrome.storage.local.get(["kickIndex", "followsCache"]);
+  if (!s.kickIndex && s.followsCache?.list?.length) rebuildKickIndex();
+})();
+
+// ---------- Twitch chat in its own window ("Pop out" on a Kick page) ----------
+async function openChatWindow(login) {
+  const l = String(login || "").toLowerCase();
+  if (!LOGIN_RE.test(l) || l === "__proto__") throw new Error("Not a valid Twitch channel name.");
+  await chrome.windows.create({
+    url: chrome.runtime.getURL(`twitch-chat.html?channel=${encodeURIComponent(l)}&view=popup`),
+    type: "popup", width: 420, height: 720,
+  });
+  return { ok: true };
 }

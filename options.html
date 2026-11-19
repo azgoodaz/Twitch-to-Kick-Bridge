@@ -55,7 +55,6 @@
   <small>Credentials are stored locally in this browser profile (dev/testing use).</small>
 
   <div class="tabs" role="tablist" aria-label="Settings sections">
-    <button class="tab" role="tab" id="tab-about" data-tab="about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About / Info</button>
     <button class="tab" role="tab" id="tab-general" data-tab="general" aria-controls="panel-general" aria-selected="true" tabindex="0">General</button>
     <button class="tab" role="tab" id="tab-connections" data-tab="connections" aria-controls="panel-connections" aria-selected="false" tabindex="-1">Connections</button>
     <button class="tab" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">API keys</button>
@@ -63,6 +62,7 @@
     <button class="tab" role="tab" id="tab-matches" data-tab="matches" aria-controls="panel-matches" aria-selected="false" tabindex="-1">Matches</button>
     <button class="tab" role="tab" id="tab-backup" data-tab="backup" aria-controls="panel-backup" aria-selected="false" tabindex="-1">Backup</button>
     <button class="tab" role="tab" id="tab-diagnostics" data-tab="diagnostics" aria-controls="panel-diagnostics" aria-selected="false" tabindex="-1">Diagnostics</button>
+    <button class="tab" role="tab" id="tab-about" data-tab="about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About / Info</button>
   </div>
 
   <section role="tabpanel" id="panel-general" aria-labelledby="tab-general">
@@ -81,6 +81,14 @@
   <small>The number of followed streamers who were live on Kick at the last check. It updates when a
     check finishes (first load, or ↻ in the popup), not on its own.</small>
 
+
+  <label style="font-weight:400"><input id="showTwitchChat" type="checkbox" style="width:auto">
+    Show Twitch Chat on Kick pages</label>
+  <small>Off by default. On the Kick channel of a streamer you follow on Twitch, a <b>Kick | Twitch</b> switch appears over Kick's chat.
+    Pick Twitch to chat there instead, in the same place, so you can talk in both. It signs in with your existing Twitch login
+    (no second sign-in) once you allow chat permission. Nothing connects to Twitch until you open the Twitch tab. Possible
+    impersonators never get one.</small>
+  <p><small id="chatPermNote"></small> <button id="chatPermAllow" class="secondary" type="button" hidden>Allow Twitch chat</button></p>
 
   <h2>Automatic refresh</h2>
   <small>How often the extension refreshes by itself while Chrome is running. The two are independent. The ↻ button in the
@@ -134,6 +142,10 @@
     </div>
   </div>
   <div class="conn">
+    <div><strong>Twitch chat permission</strong><br><small id="chatPermState">…</small></div>
+    <div class="btns"><button id="chatPermBtn" class="secondary">Allow Twitch chat</button></div>
+  </div>
+  <div class="conn">
     <div><strong>Kick</strong><br><small id="kickState">…</small></div>
     <div class="btns">
       <button id="kickConnect">Connect</button>
@@ -164,7 +176,7 @@
 
   <h2>Test a lookup</h2>
   <div class="row">
-    <input id="testLogin" placeholder="Twitch username, e.g. summit1g">
+    <input id="testLogin" placeholder="Twitch username, e.g. xqc">
     <button id="test">Test</button>
   </div>
   <pre id="out">—</pre>
@@ -335,6 +347,31 @@
   </details>
 
   <details>
+    <summary>Twitch chat on Kick pages</summary>
+    <p>Turn on <b>Show Twitch Chat</b> in Settings → General → Display (it's off by default). When you open the Kick channel of a
+      streamer you follow on Twitch, a <b>Kick | Twitch</b> switch appears at the top of Kick's chat. <b>Kick</b> is Kick's chat as
+      usual. <b>Twitch</b> puts that streamer's Twitch chat in the same place, so you can follow and talk in both. Switching back to
+      Kick keeps the Twitch chat connected underneath.</p>
+    <ul>
+      <li><b>One login:</b> the Twitch chat is a small chat client built into the extension and signed in with the Twitch login you
+        already gave it, so there is no second sign-in. Chatting needs an extra permission (read and send chat messages) that you
+        allow in Settings → Connections; until then it is read-only. Twitch's own chat embed can't share your login, which is why the
+        extension has its own.</li>
+      <li><b>Which channels:</b> only Kick channels matched to a streamer you follow on Twitch (the same matches as the popup). A
+        possible impersonator, or a match you marked “not them”, gets no tab. A channel matched by name only shows a small
+        “Same username, not verified” note.</li>
+      <li><b>Nothing connects to Twitch until you open the Twitch tab.</b> To sit on top of Kick's chat, the extension looks at where
+        Kick's chat column is on screen (found from the chat container's id, or from its message box; never from Kick's styling). It doesn't read Kick's chat or
+        change Kick's page.</li>
+      <li><b>If it can't find Kick's chat</b> (Kick changed its layout), a floating “Twitch chat” panel is used instead: drag it by its
+        title bar and resize it from the corner. Settings → Diagnostics shows which one is in use.</li>
+      <li><b>Pop out</b> opens the chat in its own window. It's also offered if Kick's page doesn't allow the frame.</li>
+      <li><b>What it shows:</b> messages with names, colours, emotes and badges, and your own messages as you send them (including
+        /me). Other chat commands, and third-party emotes, aren't supported. Twitch's own rules still apply, such as slow mode.</li>
+    </ul>
+  </details>
+
+  <details>
     <summary>Your corrections and backups</summary>
     <p>Your corrections always win over the automatic result. Settings → Backup saves your corrections, favorites and
       settings to a file you can restore later. Backups never include API keys, secrets, your Twitch or Kick logins, or
@@ -349,10 +386,15 @@
       because there is no server. The extension talks only to:</p>
     <ul>
       <li><b>Twitch:</b> api.twitch.tv and id.twitch.tv, plus profile pictures from static-cdn.jtvnw.net, and the
-        twitch.tv pages it adds its button to.</li>
+        twitch.tv pages it adds its button to. With Show Twitch Chat on, the chat server irc-ws.chat.twitch.tv, but only after you open
+        the Twitch tab.</li>
       <li><b>Kick:</b> api.kick.com and id.kick.com, kick.com for profile details, and files.kick.com for pictures.</li>
     </ul>
-    <p>The Twitch login only asks to read who you follow. The Kick login only asks to read your profile and isn't used for
+    <p>With Show Twitch Chat on, Twitch chat is shown on Kick channel pages by the extension's own chat client, only after you open the
+      Twitch tab. The extension saves which tab you last used, and where you left the floating panel (position, size, open or closed),
+      on this computer.</p>
+    <p>The Twitch login only asks to read who you follow, plus, only if you allow it, to read and send chat messages. The Kick login only
+      asks to read your profile and isn't used for
       anything yet. Removing the extension deletes all of this, so export a backup first.</p>
   </details>
 
