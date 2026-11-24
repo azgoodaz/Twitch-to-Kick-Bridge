@@ -1,13 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Twitch → Kick Bridge",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "description": "Shows a Kick profile button on Twitch channels when the streamer is also on Kick.",
   "permissions": [
     "storage",
     "identity",
     "alarms",
-    "notifications"
+    "notifications",
+    "webRequest",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "https://www.twitch.tv/*",
@@ -17,7 +19,8 @@
     "https://api.kick.com/*",
     "https://kick.com/*",
     "https://static-cdn.jtvnw.net/*",
-    "https://files.kick.com/*"
+    "https://files.kick.com/*",
+    "https://www.kick.com/*"
   ],
   "background": {
     "service_worker": "background.js"

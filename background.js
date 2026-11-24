@@ -9,7 +9,8 @@ const HANDLERS = {
   LOOKUP: (m) => lookup(m.login),               // content script (single channel)
   START_SCAN: (m) => startScan(m),               // popup: first load or the refresh button
   TWITCH_LOGIN: (m) => twitchLogin({ chat: Boolean(m && m.chat) }), // popup / settings / chat page: connect Twitch (chat: also ask to read+send chat)
-  OPEN_CHAT_WINDOW: (m) => openChatWindow(m.login),                 // Kick page: "Pop out" the Twitch chat
+  OPEN_DIAGNOSTICS: () => chrome.tabs.create({ url: chrome.runtime.getURL("options.html#diagnostics") }).then(() => ({ ok: true })), // Kick page: "Not loading? See why"
+  OPEN_CHAT_WINDOW: (m) => openChatWindow(m.login, m.style),         // Kick page: "Pop out" the Twitch chat (in the chosen style)
   TWITCH_LOGOUT: () => twitchLogout(),           // settings / popup: log out of Twitch
   KICK_LOGIN: () => kickLogin(),                 // settings: connect Kick
   KICK_LOGOUT: () => kickLogout(),               // settings: log out of Kick
@@ -862,7 +863,7 @@ async function noteRateLimit(err) {
 // Everything here can be re-fetched. Logins, credentials and settings are kept.
 const CACHE_KEYS = [
   "followsCache", "followCount", "scanState", "scanItems", "scanIndex", "scanLive", "scanTotal",
-  "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck", "autoCheck", "kickIndex", "kickChatDetect",
+  "kickToken", "twitchToken", "errorLog", "rateLimit", "favState", "favCheck", "autoCheck", "kickIndex", "kickChatDetect", "twitchEmbedProbe", "kickPolicy",
 ];
 
 async function clearCache() {
@@ -1204,6 +1205,7 @@ const MAX_IMPORT = 5000;
 const own = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key); // `in` would also match "constructor", "toString"...
 const BACKUP_SETTINGS = {
   minimal: { type: "bool" }, showBadge: { type: "bool" }, notifyFavorites: { type: "bool" }, liveOnly: { type: "bool" }, showTwitchChat: { type: "bool" },
+  twitchChatStyle: { type: "enum", values: ["builtin", "official"] }, // the extension's own chat, or Twitch's real chat page
   rateBatch: { type: "int", min: 10, max: 1000 }, rateMinutes: { type: "int", min: 1, max: 60 },
   themeFollowSystem: { type: "bool" }, theme: { type: "enum", values: ["light", "dark"] },
   favoritesMinutes: { type: "enum", values: [5, 10, 30, 60] },
@@ -1338,12 +1340,137 @@ chrome.storage.onChanged.addListener((changes, area) => {
 })();
 
 // ---------- Twitch chat in its own window ("Pop out" on a Kick page) ----------
-async function openChatWindow(login) {
+async function openChatWindow(login, style) {
   const l = String(login || "").toLowerCase();
   if (!LOGIN_RE.test(l) || l === "__proto__") throw new Error("Not a valid Twitch channel name.");
-  await chrome.windows.create({
-    url: chrome.runtime.getURL(`twitch-chat.html?channel=${encodeURIComponent(l)}&view=popup`),
-    type: "popup", width: 420, height: 720,
-  });
+  // Twitch's own style opens Twitch's own pop-out chat: it's a normal twitch.tv page, so it's signed in with your twitch.tv login
+  const url = style === "official"
+    ? `https://www.twitch.tv/popout/${encodeURIComponent(l)}/chat?popout=`
+    : chrome.runtime.getURL(`twitch-chat.html?channel=${encodeURIComponent(l)}&view=popup`);
+  await chrome.windows.create({ url, type: "popup", width: 420, height: 720 });
   return { ok: true };
+}
+
+// ---------- Twitch's own chat on Kick: how did Twitch answer the frame? ----------
+// A blank chat has several possible causes: Twitch refusing to be framed, an ad/privacy blocker, the browser's own rules. Chrome lets an
+// extension WATCH (never change) the answer to a request. Only the chat frame itself is watched (www.twitch.tv/embed/<channel>/chat, a
+// sub-frame request), so a refusal can be named: shown in Settings > Diagnostics, and explained in the panel instead of leaving it blank.
+function ancestorAllows(tokens, host) {
+  for (const raw of tokens) {
+    const low = String(raw).toLowerCase();
+    if (low === "https:") return true; // a bare scheme allows any https site
+    const t = low.replace(/^[a-z]+:\/\//, "").replace(/[:/].*$/, "");
+    if (t === "*" || t === host) return true;
+    if (t.startsWith("*.") && host.endsWith(t.slice(1))) return true;
+  }
+  return false;
+}
+const headerValues = (headers, name) => (headers || []).filter((h) => String(h.name).toLowerCase() === name).map((h) => String(h.value || ""));
+
+// Twitch's answer (status + headers) -> a verdict. `parent` is the site the chat is being shown on (kick.com).
+function analyzeEmbedResponse({ status, headers, parent, kickPolicy }) {
+  if (status >= 300 && status < 400) return { verdict: "redirect" }; // not the final answer
+  if (status >= 400) return { verdict: "http-error", status };
+  if (/\b(DENY|SAMEORIGIN)\b/.test(headerValues(headers, "x-frame-options").join(",").toUpperCase())) return { verdict: "refused-xfo", status };
+  for (const csp of headerValues(headers, "content-security-policy")) {
+    const m = /(?:^|;)\s*frame-ancestors\s+([^;]*)/i.exec(csp);
+    if (!m) continue;
+    const tokens = m[1].trim().split(/\s+/).filter(Boolean);
+    if (!ancestorAllows(tokens, String(parent || "").toLowerCase())) return { verdict: "refused-ancestors", status, ancestors: tokens.join(" ").slice(0, 200) };
+  }
+  // Kick's page can tell Chrome to refuse any frame that doesn't opt in (Cross-Origin-Embedder-Policy). Twitch's doesn't, so Chrome
+  // replaces it with an error page, yet Twitch's own answer looks perfectly fine. Unless the fix below is active, that is the cause.
+  const twitchCoep = (headerValues(headers, "cross-origin-embedder-policy")[0] || "").trim().toLowerCase();
+  if (kickPolicy && kickPolicy.coep && kickPolicy.fix !== "installed" && !/^(require-corp|credentialless)/.test(twitchCoep)) return { verdict: "blocked-by-coep", status, kickCoep: kickPolicy.coep };
+  return { verdict: "ok", status };
+}
+// The request never got an answer.
+function analyzeEmbedError(error) {
+  const e = String(error || "");
+  if (/ERR_ABORTED/.test(e)) return { verdict: "aborted" }; // replaced by another load: not a failure
+  if (/ERR_BLOCKED_BY_CLIENT/.test(e)) return { verdict: "blocked-by-extension", error: e };
+  if (/ERR_BLOCKED_BY_RESPONSE|ERR_BLOCKED_BY_CSP/.test(e)) return { verdict: "blocked-by-response", error: e };
+  if (/ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|ERR_CONNECTION|ERR_NETWORK|ERR_TIMED_OUT/.test(e)) return { verdict: "offline", error: e };
+  return { verdict: "failed", error: e };
+}
+// The facts of Twitch's answer, kept so a refusal can be traced to its real cause instead of guessed at.
+function embedSeen(status, headers) {
+  const first = (n) => headerValues(headers, n)[0] || "";
+  const ancestors = headerValues(headers, "content-security-policy").map((c) => /(?:^|;)\s*frame-ancestors\s+([^;]*)/i.exec(c)).filter(Boolean).map((m) => m[1].trim());
+  return { status, xfo: headerValues(headers, "x-frame-options").join(", ").slice(0, 60), frameAncestors: ancestors.join(" | ").slice(0, 200), coep: first("cross-origin-embedder-policy").slice(0, 60),
+    corp: first("cross-origin-resource-policy").slice(0, 60), coop: first("cross-origin-opener-policy").slice(0, 60), type: first("content-type").split(";")[0].slice(0, 40), location: first("location").slice(0, 120) };
+}
+async function recordEmbed(d, result) {
+  if (result.verdict === "redirect" || result.verdict === "aborted") return;
+  let u;
+  try { u = new URL(d.url); } catch (e) { return; }
+  const m = /^\/embed\/([^/]+)\/chat$/.exec(u.pathname);
+  if (!m) return;
+  const probe = { at: Date.now(), channel: decodeURIComponent(m[1]).toLowerCase(), parent: u.searchParams.get("parent") || "", ...result };
+  await chrome.storage.local.set({ twitchEmbedProbe: probe });
+  if (d.tabId >= 0 && chrome.tabs && chrome.tabs.sendMessage) { // tell that Kick page, so its panel can say what happened
+    try { chrome.tabs.sendMessage(d.tabId, { type: "TWITCH_EMBED_RESULT", channel: probe.channel, verdict: probe.verdict, status: probe.status || 0 }).catch(() => {}); } catch (e) { /* the page has gone */ }
+  }
+}
+// ---------- Kick's own page policy, and the fix for it ----------
+// Some Kick pages send "Cross-Origin-Embedder-Policy". Chrome then refuses to show ANY outside page in a frame unless that page opts in
+// with two headers of its own. Twitch's chat doesn't, so Chrome shows an error page ("blocked") while Twitch itself answers normally.
+// (Pop-out isn't affected: it is a normal window, not a frame on Kick's page.) The fix: on Kick pages that send it, and only for Twitch's
+// chat frame on Kick pages, add the two opt-in headers to Twitch's response. Nothing else is touched.
+const COEP_RULE_ID = 1;
+const COEP_RULE = {
+  id: COEP_RULE_ID, priority: 1,
+  action: { type: "modifyHeaders", responseHeaders: [
+    { header: "Cross-Origin-Embedder-Policy", operation: "set", value: "credentialless" },
+    { header: "Cross-Origin-Resource-Policy", operation: "set", value: "cross-origin" },
+  ] },
+  condition: { urlFilter: "||www.twitch.tv/embed/", resourceTypes: ["sub_frame"], initiatorDomains: ["kick.com", "www.kick.com"] },
+};
+function analyzeKickPolicy(headers) {
+  const coep = (headerValues(headers, "cross-origin-embedder-policy")[0] || "").trim().toLowerCase().split(";")[0];
+  const csp = headerValues(headers, "content-security-policy");
+  const directive = (name) => { for (const c of csp) { const m = new RegExp("(?:^|;)\\s*" + name + "\\s+([^;]*)", "i").exec(c); if (m) return m[1].trim(); } return null; };
+  const frameSrc = [directive("frame-src"), directive("child-src"), directive("default-src")].find((v) => v !== null) ?? null;
+  const first = (n) => (headerValues(headers, n)[0] || "").slice(0, 60);
+  return { coep: /^(require-corp|credentialless)$/.test(coep) ? coep : "", coepRaw: first("cross-origin-embedder-policy"), coop: first("cross-origin-opener-policy"), corp: first("cross-origin-resource-policy"), referrer: first("referrer-policy"),
+    frameSrc: frameSrc === null ? "" : frameSrc.slice(0, 200),
+    twitchAllowed: frameSrc === null ? null : ancestorAllows(frameSrc.split(/\s+/).filter(Boolean), "www.twitch.tv") };
+}
+// Make the rule match what's wanted: installed only while Show Twitch Chat is on AND Kick sends that policy.
+async function syncCoepFix() {
+  if (!chrome.declarativeNetRequest) return;
+  const { kickPolicy, showTwitchChat } = await chrome.storage.local.get(["kickPolicy", "showTwitchChat"]);
+  const want = Boolean(showTwitchChat && kickPolicy && kickPolicy.coep);
+  let ok = true;
+  try {
+    const has = (await chrome.declarativeNetRequest.getDynamicRules()).some((r) => r.id === COEP_RULE_ID);
+    if (want && !has) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [COEP_RULE_ID], addRules: [COEP_RULE] });
+    if (!want && has) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [COEP_RULE_ID] });
+  } catch (e) { ok = false; console.debug("[Kick Bridge] couldn't adjust the chat frame rule", e); }
+  if (!kickPolicy) return;
+  const fix = !kickPolicy.coep ? "not-needed" : !showTwitchChat ? "off" : ok ? "installed" : "failed";
+  if (kickPolicy.fix !== fix) await chrome.storage.local.set({ kickPolicy: { ...kickPolicy, fix } });
+}
+async function recordKickPolicy(p) {
+  const { kickPolicy: prev } = await chrome.storage.local.get("kickPolicy");
+  const same = prev && prev.coep === p.coep && prev.frameSrc === p.frameSrc && prev.twitchAllowed === p.twitchAllowed && prev.host === p.host && prev.coepRaw === p.coepRaw && prev.coop === p.coop && prev.corp === p.corp && prev.referrer === p.referrer;
+  if (!same || Date.now() - prev.at > 3_600_000) await chrome.storage.local.set({ kickPolicy: { ...p, at: Date.now(), fix: prev && prev.fix } });
+  else await syncCoepFix();
+}
+chrome.storage.onChanged.addListener((changes, area) => { if (area === "local" && (changes.showTwitchChat || changes.kickPolicy)) syncCoepFix(); });
+syncCoepFix(); // after a browser restart
+
+if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
+  const parentOf = (url) => { try { return new URL(url).searchParams.get("parent") || ""; } catch (e) { return ""; } };
+  const EMBED_FILTER = { urls: ["https://www.twitch.tv/embed/*"], types: ["sub_frame"] };
+  chrome.webRequest.onHeadersReceived.addListener(async (d) => {
+    const { kickPolicy } = await chrome.storage.local.get("kickPolicy");
+    recordEmbed(d, { ...analyzeEmbedResponse({ status: d.statusCode, headers: d.responseHeaders, parent: parentOf(d.url), kickPolicy }), seen: embedSeen(d.statusCode, d.responseHeaders) });
+  }, EMBED_FILTER, ["responseHeaders"]);
+  chrome.webRequest.onErrorOccurred.addListener((d) => recordEmbed(d, analyzeEmbedError(d.error)), EMBED_FILTER);
+  // Kick's own page (just its policy headers, nothing else about it)
+  chrome.webRequest.onHeadersReceived.addListener((d) => {
+    let host = ""; try { host = new URL(d.url).hostname; } catch (e) { return; }
+    recordKickPolicy({ host, ...analyzeKickPolicy(d.responseHeaders) });
+  }, { urls: ["https://kick.com/*", "https://www.kick.com/*"], types: ["main_frame"] }, ["responseHeaders"]);
 }

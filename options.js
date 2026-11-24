@@ -146,6 +146,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
 chrome.storage.local.get("showTwitchChat").then((s) => ($("showTwitchChat").checked = Boolean(s.showTwitchChat)));
 $("showTwitchChat").addEventListener("change", (e) => chrome.storage.local.set({ showTwitchChat: e.target.checked }));
 
+// Which Twitch chat: the extension's own, or Twitch's real chat page. Also changed by the button on the chat itself.
+const styleOf = (v) => (v === "official" ? "official" : "builtin");
+chrome.storage.local.get("twitchChatStyle").then((s) => ($("twitchChatStyle").value = styleOf(s.twitchChatStyle)));
+$("twitchChatStyle").addEventListener("change", (e) => chrome.storage.local.set({ twitchChatStyle: styleOf(e.target.value) }));
+chrome.storage.onChanged.addListener((ch, area) => { if (area === "local" && ch.twitchChatStyle) $("twitchChatStyle").value = styleOf(ch.twitchChatStyle.newValue); });
+
 // Toolbar badge: saved immediately; the background worker reacts to the change.
 chrome.storage.local.get("showBadge").then((s) => ($("showBadge").checked = Boolean(s.showBadge)));
 $("showBadge").addEventListener("change", (e) => chrome.storage.local.set({ showBadge: e.target.checked }));
@@ -363,6 +369,32 @@ function buildDiagnostics(all, total, now, quota, extra = {}) { // extra: { favN
     : det.mode === "floating" ? { text: `kick.com/${det.slug}: floating panel, couldn't find Kick's chat column. Kick's layout may have changed (seen ${ago(now - det.at)})`, status: "warn" }
     : { text: `kick.com/${det.slug}: matched, still looking for Kick's chat (seen ${ago(now - det.at)})`, status: "" };
   add("Twitch chat on Kick", how.text, how.status);
+  const kp = all.kickPolicy;
+  const kickText = !kp ? { text: "No Kick page seen yet", status: "" }
+    : !kp.coep ? { text: `${kp.host} sends no embedder policy, so nothing needs adjusting${kp.frameSrc && kp.twitchAllowed === false ? ". Its page policy lists frame sources without twitch.tv (frames added by an extension are normally exempt)" : ""}`, status: "" }
+    : kp.fix === "installed" ? { text: `${kp.host} sends Cross-Origin-Embedder-Policy: ${kp.coep}. Chrome blocks frames that don't opt in, so the extension adds the two opt-in headers to Twitch's chat frame (on Kick pages only)`, status: "" }
+    : kp.fix === "off" ? { text: `${kp.host} sends Cross-Origin-Embedder-Policy: ${kp.coep}, which blocks Twitch's chat frame. Turn on Show Twitch Chat and the extension adjusts it`, status: "warn" }
+    : { text: `${kp.host} sends Cross-Origin-Embedder-Policy: ${kp.coep}, which blocks Twitch's chat frame, and the extension couldn't adjust it. Use Pop out or Basic chat`, status: "warn" };
+  add("Kick's page policy", kickText.text, kickText.status);
+  const pr = all.twitchEmbedProbe;
+  const sn = pr && pr.seen;
+  add("Twitch's answer (raw)", sn ? `HTTP ${sn.status} · frame-ancestors: ${sn.frameAncestors || "none"} · X-Frame-Options: ${sn.xfo || "none"} · COEP: ${sn.coep || "none"} · CORP: ${sn.corp || "none"} · COOP: ${sn.coop || "none"} · ${sn.type || "?"}${sn.location ? ` · redirects to ${sn.location}` : ""}` : "(none yet)");
+  add("Kick's page (raw)", kp ? `COEP: ${kp.coepRaw || "none"} · COOP: ${kp.coop || "none"} · CORP: ${kp.corp || "none"} · Referrer-Policy: ${kp.referrer || "default"} · frame rules: ${kp.frameSrc || "none"}` : "(none yet)");
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  add("Browser", (/(?:Chrome|Chromium|Edg|OPR)\/[\d.]+/.exec(ua) || [])[0] || ua.slice(0, 60) || "unknown");
+  const seen = pr ? `, seen ${ago(now - pr.at)}` : "";
+  const embedText = {
+    ok: pr && `Twitch served its chat for ${pr.channel} normally (HTTP ${pr.status}, allowed on ${pr.parent || "this site"})${seen}. If the panel is still blank, the browser is stopping it from drawing: check that third-party cookies are allowed for twitch.tv, and any ad or privacy blocker`,
+    "refused-xfo": pr && `Twitch forbids showing its chat inside another site for ${pr.channel} (X-Frame-Options)${seen}`,
+    "refused-ancestors": pr && `Twitch refused to show its chat on ${pr.parent}: it only allows ${pr.ancestors}${seen}`,
+    "http-error": pr && `Twitch answered with an error for ${pr.channel}: HTTP ${pr.status}${seen}`,
+    "blocked-by-extension": pr && `A browser extension (such as an ad or privacy blocker) blocked Twitch's chat frame (${pr.error})${seen}`,
+    "blocked-by-response": pr && `The browser blocked Twitch's chat frame because of a security header (${pr.error})${seen}`,
+    "blocked-by-coep": pr && `Chrome blocked the chat frame: Kick's page sends Cross-Origin-Embedder-Policy (${pr.kickCoep}), which needs the extension's adjustment to Twitch's frame, and that isn't active${seen}`,
+    offline: pr && `Couldn't reach Twitch (${pr.error})${seen}`,
+    failed: pr && `Twitch's chat frame failed to load (${pr.error})${seen}`,
+  };
+  add("Twitch's own chat (Full)", pr ? (embedText[pr.verdict] || `Unknown result: ${pr.verdict}`) : "No load seen yet (choose Full chat in Display, then open the Twitch tab)", pr && pr.verdict !== "ok" ? "warn" : "");
   const chatChannels = Object.keys(all.kickIndex || {}).length;
   add("Twitch chat index", chatChannels ? `${chatChannels} Kick channels can show Twitch chat` : "Empty (built from your matches after a check)");
   if (typeof fcount === "number") add("Follow count", `${fcount}. The refresh button compares Twitch's current number with this one`);
@@ -641,7 +673,7 @@ renderOverrides();
 
 // ---------- Backup ----------
 // ==== backup-pure-start (no chrome.* calls in here, so it can be tested)
-const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "showTwitchChat", "rateBatch", "rateMinutes", "themeFollowSystem", "theme", "favoritesMinutes", "autoRefreshMinutes"];
+const BACKUP_SETTING_KEYS = ["minimal", "showBadge", "notifyFavorites", "liveOnly", "showTwitchChat", "twitchChatStyle", "rateBatch", "rateMinutes", "themeFollowSystem", "theme", "favoritesMinutes", "autoRefreshMinutes"];
 const BACKUP_KEYS = ["kickOverrides", "favorites", ...BACKUP_SETTING_KEYS];
 
 // What goes into the file: corrections, favorites, and display/speed/notification settings.

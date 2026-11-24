@@ -4,13 +4,15 @@
 // Twitch (matched by the extension, and not a possible impersonator) a "Kick | Twitch" switch appears over Kick's chat.
 // Pick Twitch and that streamer's Twitch chat takes the place of Kick's chat (Kick's chat keeps running underneath).
 //
-// - The chat is the extension's own small Twitch chat client (twitch-chat.html), signed in with the Twitch login you already
-//   gave the extension (needs the optional chat permission, otherwise read-only). It is NOT Twitch's embed: that can't share
-//   your login.
+// - Two styles (Settings, or the button at the top of the chat):
+//     Basic ("builtin"): the extension's own small chat client (twitch-chat.html), signed in with the Twitch login you already gave the
+//               extension. No emote picker, bits, polls or predictions.
+//     Full ("official"): Twitch's own chat, the real page (twitch.tv/embed/.../chat) in a frame, with all of Twitch's features. It signs in with
+//               your twitch.tv login in this browser; nothing can hand it the extension's login.
 // - Nothing connects to Twitch until you open the Twitch tab.
 // - Kick's page is never changed. To sit on top of Kick's chat the script looks at where its chat column is on screen
 //   (found by the chat container's id, or from the message box; never from Kick's styling classes) and places its own overlay
-//   there. It doesn't read chat messages.
+//   there. It doesn't read chat messages. It also looks at the layer of Kick's notification banners so it sits just below them.
 // - If the chat column can't be found (Kick changed its layout), a floating panel you can drag and resize is used instead.
 // - If Kick's page policy blocks the frame, or it doesn't load, the panel offers "Pop out" (a separate window).
 
@@ -33,6 +35,31 @@ function channelSlug(pathname) {
 function chatPageUrl(pageUrl, login, view) {
   return `${pageUrl}?channel=${encodeURIComponent(login)}&view=${encodeURIComponent(view)}`;
 }
+// Twitch's own chat page. `parent` must be the host of the page that embeds it, or Twitch refuses to load it.
+function officialChatUrl(login, host) {
+  return `https://www.twitch.tv/embed/${encodeURIComponent(login)}/chat?parent=${encodeURIComponent(host)}&darkpopout`;
+}
+// What to tell the user when Twitch's own chat frame fails (the background worker watches how Twitch answers it).
+function embedProblemText(verdict, status) {
+  switch (verdict) {
+    case "blocked-by-extension": return "A browser extension (such as an ad or privacy blocker) blocked Twitch's chat. Allow www.twitch.tv in it, or use Pop out or Basic chat.";
+    case "refused-xfo":
+    case "refused-ancestors": return "Twitch is refusing to show its chat on this site. Use Pop out or Basic chat.";
+    case "blocked-by-coep": return "Kick's page tells Chrome to refuse frames from sites that don't opt in to its security policy, and Twitch's chat frame couldn't be adjusted. Use Pop out or Basic chat.";
+    case "http-error": return `Twitch answered with an error (HTTP ${status}). Try again in a moment, or use Pop out or Basic chat.`;
+    case "blocked-by-response": return "The browser blocked Twitch's chat frame because of a security setting. Use Pop out or Basic chat.";
+    case "offline": return "Couldn't reach Twitch. Check your connection, or use Basic chat.";
+    case "failed": return "Twitch's chat frame failed to load. Use Pop out or Basic chat.";
+    default: return "";
+  }
+}
+// Shown BEHIND Twitch's chat frame: if the frame draws nothing (a blank, see-through page), this is what you see instead of nothing.
+const BLANK_HINT = "Waiting for Twitch's chat. If this stays empty, Twitch's chat isn't being allowed to draw here: a browser extension or the browser's cookie settings can cause that. Pop out opens it in its own window, or switch to Basic chat. Settings → Diagnostics shows what Twitch answered.";
+const validStyle = (v) => (v === "official" ? "official" : "builtin");
+const styleButtonText = (style) => (style === "official" ? "Basic chat" : "Full chat"); // names the style you would switch TO
+const styleButtonTitle = (style) => (style === "official"
+  ? "Switch to the basic chat built into this extension (signs in with this extension's login)"
+  : "Switch to the full chat: Twitch's own chat, with the emote picker and all of Twitch's features (signs in with your twitch.tv login)");
 
 // Which ancestor of Kick's message box is the chat column? `chain` = its ancestors' rectangles, nearest first. The column is
 // the HIGHEST ancestor that is still column-shaped: 240-560 px wide, most of the window tall, against the right edge, near the
@@ -47,6 +74,14 @@ function pickChatColumn(chain, vw, vh) {
   return best;
 }
 const FLOAT_AFTER = 3000; // ms to look for Kick's chat column before using the floating panel
+
+// Kick shows "x is live" banners (a toaster library whose layer is very high). Our panel must sit just BELOW them, so a banner
+// is never hidden by it. toasterZ = the banner container's computed z-index, if it's on the page.
+const DEFAULT_TOAST_Z = 999999999;
+function overlayLayer(toasterZ) {
+  const t = Number.isFinite(toasterZ) && toasterZ > 1 ? toasterZ : DEFAULT_TOAST_Z;
+  return Math.max(1, Math.min(t - 1, 2147483000));
+}
 
 const MIN_W = 260, MIN_H = 240;
 // Floating panel: keeps it fully on screen, whatever size the window is now.
@@ -70,23 +105,24 @@ function tierNote(tier) {
 // ==== kick-pure-end
 
 if (window.top === window) { // not inside Kick's own frames
-  const state = { enabled: false, index: {}, tab: "kick", open: false, box: null, login: null, name: "", tier: "" };
+  const state = { enabled: false, index: {}, tab: "kick", style: "builtin", open: false, box: null, login: null, name: "", tier: "" };
   let host = null;
   let shadow = null;    // the host's shadow root (what attachShadow returns)
   let mode = null;      // "docked" (over Kick's chat column) | "floating" | null
-  let view = null;      // the UI of the current mode: { body, frame, msg, frameLogin, ... }
+  let view = null;      // the UI of the current mode: { body, frame, msg, frameLogin, frameStyle, ... }
   let column = null;    // Kick's chat column element (read-only: we only measure it)
-  let since = 0;
+  let since = 0, sinceSlug = null;
   let loadTimer = null, saveTimer = null, trackTimer = null, waitTimer = null, renderTimer = null;
   let drag = null;
 
+  // z-index comes from --layer (set from Kick's banner layer), so Kick's "x is live" banners show OVER the panel.
   const CSS = `
     :host { all: initial; }
-    .pill { position: fixed; left: 16px; bottom: 16px; z-index: 2147483000; display: inline-flex; align-items: center; gap: 8px;
+    .pill { position: fixed; left: 16px; bottom: 16px; z-index: var(--layer, 999999000); display: inline-flex; align-items: center; gap: 8px;
       padding: 9px 15px; background: #9146ff; color: #fff; border: 0; border-radius: 999px; font: 600 13px/1 system-ui, sans-serif;
       cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.45); }
     .pill:hover { filter: brightness(1.1); }
-    .win { position: fixed; z-index: 2147483000; display: flex; flex-direction: column; box-sizing: border-box; min-width: ${MIN_W}px;
+    .win { position: fixed; z-index: var(--layer, 999999000); display: flex; flex-direction: column; box-sizing: border-box; min-width: ${MIN_W}px;
       min-height: ${MIN_H}px; resize: both; overflow: hidden; background: #0e0e10; color: #efeff1; border: 1px solid #2f2f35;
       border-top: 2px solid #9146ff; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.55); font: 13px/1.3 system-ui, sans-serif; }
     .pill[hidden], .win[hidden], .msg[hidden], iframe[hidden], .dock[hidden], .tw[hidden] { display: none; }
@@ -95,22 +131,32 @@ if (window.top === window) { // not inside Kick's own frames
     .bar:active { cursor: grabbing; }
     .title { flex: 1; min-width: 0; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .note { font-size: 11px; color: #adadb8; white-space: nowrap; }
-    .bar button, .msg button, .tw .pop { font: inherit; border: 0; border-radius: 6px; padding: 4px 9px; background: #26262c; color: #efeff1; cursor: pointer; }
-    .bar button:hover, .tw .pop:hover { background: #34343c; }
+    .bar button, .msg button, .tw .pop, .tw .style { font: inherit; border: 0; border-radius: 6px; padding: 4px 9px; background: #26262c; color: #efeff1; cursor: pointer; }
+    .bar button:hover, .tw .pop:hover, .tw .style:hover { background: #34343c; }
     .body { position: relative; flex: 1; min-height: 0; }
-    iframe { display: block; width: 100%; height: 100%; border: 0; }
+    iframe { position: relative; z-index: 1; display: block; width: 100%; height: 100%; border: 0; }
+    .hint { position: absolute; inset: 0; z-index: 0; padding: 16px; color: #adadb8; }
+    .hint[hidden] { display: none; }
     .msg { padding: 16px; color: #adadb8; }
-    .msg button { margin-top: 10px; background: #9146ff; color: #fff; padding: 7px 12px; font-weight: 600; }
+    .foot { display: flex; justify-content: space-between; gap: 8px; padding: 3px 10px; background: #0e0e10; border-top: 1px solid #26262c; font-size: 11px; }
+    .foot[hidden] { display: none; }
+    .foot button { background: none; border: 0; padding: 2px 4px; color: #bf94ff; font: inherit; cursor: pointer; }
+    .foot button:hover { text-decoration: underline; background: none; }
+    .msg button { margin: 10px 8px 0 0; background: #9146ff; color: #fff; padding: 7px 12px; font-weight: 600; }
+    .msg button.alt { background: #26262c; color: #efeff1; }
     /* docked: sits exactly over Kick's chat column */
-    .dock { position: fixed; z-index: 2147483000; pointer-events: none; font: 13px/1.3 system-ui, sans-serif; }
-    .tabs { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 2; display: flex; gap: 2px; padding: 3px;
+    .dock { position: fixed; z-index: var(--layer, 999999000); pointer-events: none; font: 13px/1.3 system-ui, sans-serif; }
+    .tabs { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 4; display: flex; gap: 2px; padding: 3px;
       pointer-events: auto; background: #18181b; border: 1px solid #2f2f35; border-radius: 999px; box-shadow: 0 3px 10px rgba(0,0,0,.45); }
     .tabs button { border: 0; background: none; color: #adadb8; font: 600 12px/1 system-ui, sans-serif; padding: 6px 15px; border-radius: 999px; cursor: pointer; }
     .tabs button:hover { color: #efeff1; }
     .tabs .t-kick[aria-pressed="true"] { background: #53fc18; color: #0b0e0f; }
     .tabs .t-twitch[aria-pressed="true"] { background: #9146ff; color: #fff; }
     .tw { position: absolute; inset: 0; display: flex; flex-direction: column; pointer-events: auto; background: #0e0e10; color: #efeff1; padding-top: 46px; }
-    .tw .pop { position: absolute; top: 9px; right: 9px; z-index: 3; }
+    /* the two buttons take the room beside the switch (never under it) and shrink in a narrow column */
+    .tw .pop, .tw .style { position: absolute; top: 9px; z-index: 3; max-width: calc(50% - 83px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tw .pop { right: 9px; }
+    .tw .style { left: 9px; }
   `;
 
   const make = (tag, props = {}, attrs = {}) => {
@@ -127,45 +173,101 @@ if (window.top === window) { // not inside Kick's own frames
     }, 400);
   };
 
+  // Under Twitch's own chat: always there, even when the frame is blocked and shows Chrome's own error page, which we can't write on.
+  function makeFoot() {
+    const foot = make("div", { className: "foot", hidden: true });
+    const why = make("button", { type: "button", className: "f-why", textContent: "Not loading? See why", title: "Opens Settings → Diagnostics: what Twitch and Kick answered" });
+    const pop = make("button", { type: "button", className: "f-pop", textContent: "Pop out" });
+    why.addEventListener("click", () => { try { chrome.runtime.sendMessage({ type: "OPEN_DIAGNOSTICS" }).catch(() => {}); } catch (e) { /* extension reloaded: reload the page */ } });
+    pop.addEventListener("click", () => popOut());
+    foot.append(why, pop);
+    return foot;
+  }
   function popOut() {
     try {
-      chrome.runtime.sendMessage({ type: "OPEN_CHAT_WINDOW", login: state.login }).catch(() => {});
+      chrome.runtime.sendMessage({ type: "OPEN_CHAT_WINDOW", login: state.login, style: state.style }).catch(() => {});
     } catch (e) { /* the extension was reloaded under this page: reload the page */ }
   }
 
-  function showBlocked() {
-    if (!view) return;
-    if (view.frame) view.frame.hidden = true;
-    if (!view.msg) {
-      view.msg = make("div", { className: "msg" });
-      view.msg.append("Twitch chat couldn't load inside this page. You can still chat from its own window.");
-      const b = make("button", { type: "button", className: "b-pop2", textContent: "Pop out Twitch chat" });
-      b.addEventListener("click", popOut);
-      view.msg.append(make("br"), b);
-      view.body.append(view.msg);
-    }
-    view.msg.hidden = false;
+  // The banner layer, so Kick's "x is live" banners are never hidden by the panel.
+  function applyLayer() {
+    if (!host) return;
+    const t = document.querySelector("[data-sonner-toaster]");
+    const z = t ? parseInt(getComputedStyle(t).zIndex, 10) : NaN;
+    host.style.setProperty("--layer", String(overlayLayer(z)));
   }
 
-  // The chat page is loaded only when its tab/panel is opened, and kept (connected) while hidden.
+  // ---------- the chat frame ----------
+  function refreshLabels() {
+    if (view && view.foot) view.foot.hidden = state.style !== "official"; // the footer is only for Twitch's own chat, whose frame can be blocked by things we can't see
+    if (!view || !view.styleBtn) return;
+    view.styleBtn.textContent = styleButtonText(state.style);
+    view.styleBtn.title = styleButtonTitle(state.style);
+  }
+  function showBlocked(why) {
+    if (!view) return;
+    if (view.frame) view.frame.hidden = true;
+    if (view.hint) view.hint.hidden = true;
+    if (view.msg) view.msg.remove();
+    view.msg = make("div", { className: "msg" });
+    const official = state.style === "official";
+    view.msg.append(why || (official
+      ? "Twitch's chat couldn't load inside this page. Kick may not allow it, or Twitch needs you logged in here. Pop out opens it in its own window, where login always works."
+      : "Twitch chat couldn't load inside this page. You can still chat from its own window."));
+    const b = make("button", { type: "button", className: "b-pop2", textContent: "Pop out Twitch chat" });
+    b.addEventListener("click", popOut);
+    view.msg.append(make("br"), b);
+    if (official) {
+      const alt = make("button", { type: "button", className: "b-builtin alt", textContent: "Use basic chat" });
+      alt.addEventListener("click", () => setStyle("builtin"));
+      view.msg.append(alt);
+    }
+    view.body.append(view.msg);
+  }
   // Close the chat frame (and with it the connection to Twitch's chat).
   function dropFrame() {
     clearTimeout(loadTimer);
     if (view.frame) view.frame.remove();
+    if (view.hint) view.hint.remove();
+    if (view.msg) view.msg.remove();
     view.frame = null;
+    view.hint = null;
+    view.msg = null;
     view.frameLogin = null;
-    if (view.msg) view.msg.hidden = true;
+    view.frameStyle = null;
   }
+  function frameUrl() {
+    return state.style === "official"
+      ? officialChatUrl(state.login, location.hostname)
+      : chatPageUrl(chrome.runtime.getURL("twitch-chat.html"), state.login, mode === "docked" ? "docked" : "floating");
+  }
+  // The chat is loaded only when its tab/panel is opened, and kept (connected) while hidden.
   function ensureFrame() {
-    if (view.frame && view.frameLogin === state.login) return;
+    if (view.frame && view.frameLogin === state.login && view.frameStyle === state.style) return;
     dropFrame();
     view.frameLogin = state.login;
+    view.frameStyle = state.style;
     view.frame = make("iframe", { title: `Twitch chat: ${state.name}` }, { allow: "clipboard-write" });
     view.frame.addEventListener("load", () => clearTimeout(loadTimer));
+    if (state.style === "official") { // behind the frame: only visible if the frame draws nothing
+      view.hint = make("div", { className: "hint", textContent: BLANK_HINT });
+      view.body.append(view.hint);
+    }
     view.body.append(view.frame);
     clearTimeout(loadTimer);
     loadTimer = setTimeout(showBlocked, 10000);
-    view.frame.src = chatPageUrl(chrome.runtime.getURL("twitch-chat.html"), state.login, mode === "docked" ? "docked" : "floating"); // last: nothing is requested before this
+    view.frame.src = frameUrl(); // last: nothing is requested before this
+  }
+  function refreshFrame() { // the style (or streamer) changed: load the right chat now if it's showing, else on next open
+    if (!view) return;
+    dropFrame();
+    refreshLabels();
+    if (mode === "docked") applyTab(); else applyOpen();
+  }
+  function setStyle(next) {
+    state.style = validStyle(next);
+    refreshFrame();
+    chrome.storage.local.set({ twitchChatStyle: state.style });
   }
 
   // ---------- docked: over Kick's chat column ----------
@@ -194,6 +296,7 @@ if (window.top === window) { // not inside Kick's own frames
 
   function track() { // keep the overlay exactly over the column (it moves when Kick's layout does)
     if (mode !== "docked" || !view) return;
+    applyLayer();
     if (!column || !column.isConnected) { column = findChatColumn(); if (!column) { view.root.hidden = true; return; } }
     const r = column.getBoundingClientRect();
     if (r.width < 200 || r.height < 200) { view.root.hidden = true; return; } // chat collapsed
@@ -219,16 +322,20 @@ if (window.top === window) { // not inside Kick's own frames
     const twBtn = make("button", { type: "button", className: "t-twitch", textContent: "Twitch", title: `Twitch chat for ${state.name || "this streamer"}` }, { role: "tab" });
     tabs.append(kickBtn, twBtn);
     const tw = make("div", { className: "tw" });
+    const styleBtn = make("button", { type: "button", className: "style" });
     const pop = make("button", { type: "button", className: "pop", textContent: "Pop out", title: "Open Twitch chat in its own window" });
     const body = make("div", { className: "body" });
-    tw.append(pop, body);
+    const foot = makeFoot();
+    tw.append(styleBtn, pop, body, foot);
     root.append(tw, tabs);
     shadow.append(root);
-    view = { root, tabs, kickBtn, twBtn, tw, pop, body, frame: null, msg: null, frameLogin: null };
+    view = { root, tabs, kickBtn, twBtn, tw, styleBtn, pop, body, foot, frame: null, msg: null, frameLogin: null, frameStyle: null };
     const pick = (tab) => { state.tab = tab; applyTab(); chrome.storage.local.set({ twitchChatTab: tab }); };
     kickBtn.addEventListener("click", () => pick("kick"));
     twBtn.addEventListener("click", () => pick("twitch"));
+    styleBtn.addEventListener("click", () => setStyle(state.style === "official" ? "builtin" : "official"));
     pop.addEventListener("click", popOut);
+    refreshLabels();
     trackTimer = setInterval(track, 500);
     track();
     applyTab();
@@ -257,17 +364,21 @@ if (window.top === window) { // not inside Kick's own frames
     const bar = make("div", { className: "bar" });
     const title = make("span", { className: "title" });
     const note = make("span", { className: "note" });
+    const styleBtn = make("button", { type: "button", className: "b-style" });
     const pop = make("button", { type: "button", className: "b-pop", textContent: "Pop out", title: "Open Twitch chat in its own window" });
     const min = make("button", { type: "button", className: "b-min", textContent: "–", title: "Collapse" }, { "aria-label": "Collapse Twitch chat" });
     const body = make("div", { className: "body" });
-    bar.append(title, note, pop, min);
-    win.append(bar, body);
+    bar.append(title, note, styleBtn, pop, min);
+    const foot = makeFoot();
+    win.append(bar, body, foot);
     shadow.append(pill, win);
-    view = { pill, win, bar, title, note, pop, min, body, frame: null, msg: null, frameLogin: null };
+    view = { pill, win, bar, title, note, styleBtn, pop, min, body, foot, frame: null, msg: null, frameLogin: null, frameStyle: null };
+    refreshLabels();
 
     pill.addEventListener("click", () => { state.open = true; applyOpen(); saveSoon(); });
     min.addEventListener("click", () => { state.open = false; applyOpen(); saveSoon(); });
     pop.addEventListener("click", popOut);
+    styleBtn.addEventListener("click", () => setStyle(state.style === "official" ? "builtin" : "official"));
 
     // drag by the title bar (not by its buttons)
     bar.addEventListener("pointerdown", (e) => {
@@ -332,6 +443,7 @@ if (window.top === window) { // not inside Kick's own frames
     clearTimeout(waitTimer);
     mode = null;
     since = 0;
+    sinceSlug = null;
     state.login = null;
   }
   function setMode(m) {
@@ -343,12 +455,14 @@ if (window.top === window) { // not inside Kick's own frames
     shadow.append(make("style", { textContent: CSS }));
     document.body.appendChild(host);
     if (m === "docked") buildDock(); else buildFloating();
+    applyLayer();
     report();
   }
 
-  // Idempotent: called on load, on setting/index changes and on every page change.
+  // Idempotent: called on load, on setting/index changes, on every page change and on a steady beat while Kick's page changes.
   function render() {
     clearTimeout(waitTimer);
+    if (host && !host.isConnected) { clearUi(); mode = null; } // Kick's page dropped our element: rebuild it
     const slug = channelSlug(location.pathname);
     const entry = state.enabled && slug ? state.index[slug] : null;
     report();
@@ -357,7 +471,7 @@ if (window.top === window) { // not inside Kick's own frames
     state.login = entry.l;
     state.name = entry.n || entry.l;
     state.tier = entry.t;
-    if (!since) since = Date.now();
+    if (slug !== sinceSlug) { sinceSlug = slug; since = Date.now(); } // each channel gets its own 3 s to find Kick's chat
 
     if (!column || !column.isConnected) column = findChatColumn();
     if (column) {
@@ -372,21 +486,33 @@ if (window.top === window) { // not inside Kick's own frames
       view.note.textContent = note;
       view.note.title = note ? "This Kick channel has the same name as a streamer you follow on Twitch, but that isn't verified." : "";
       applyOpen();
+      applyLayer();
     } else {
       waitTimer = setTimeout(render, 500); // Kick's chat may still be loading: keep looking for a moment
     }
   }
 
-  // Kick blocks our chat frame with its page policy? Say so, and offer the pop-out. Only OUR frame counts: a blocked
-  // resource of some other extension must never hide a chat that works.
+  // Kick blocks our chat frame with its page policy? Say so, and offer the pop-out. Only OUR frame counts: a blocked resource of
+  // some other extension must never hide a chat that works.
   document.addEventListener("securitypolicyviolation", (e) => {
-    if (view && view.frame && String(e.blockedURI || "").startsWith(chrome.runtime.getURL("").replace(/\/$/, ""))) showBlocked();
+    if (!view || !view.frame) return;
+    const blocked = String(e.blockedURI || "");
+    const ours = blocked.startsWith(chrome.runtime.getURL("").replace(/\/$/, ""));
+    const twitchFrame = state.style === "official" && /^https:\/\/([a-z0-9-]+\.)*twitch\.tv(\/|$)/i.test(blocked) && /frame|child|default/.test(e.effectiveDirective || "frame-src");
+    if (ours || twitchFrame) showBlocked();
   });
 
-  chrome.storage.local.get(["showTwitchChat", "kickIndex", "twitchChatPanel", "twitchChatTab"]).then((s) => {
+  chrome.runtime.onMessage.addListener((m) => {
+    if (!m || m.type !== "TWITCH_EMBED_RESULT" || state.style !== "official" || !view || !view.frame || m.channel !== state.login) return;
+    const why = embedProblemText(m.verdict, m.status);
+    if (why) showBlocked(why); // ok -> nothing to say
+  });
+
+  chrome.storage.local.get(["showTwitchChat", "kickIndex", "twitchChatPanel", "twitchChatTab", "twitchChatStyle"]).then((s) => {
     state.enabled = Boolean(s.showTwitchChat);
     state.index = s.kickIndex || {};
     state.tab = s.twitchChatTab === "twitch" ? "twitch" : "kick";
+    state.style = validStyle(s.twitchChatStyle);
     if (s.twitchChatPanel) {
       state.open = Boolean(s.twitchChatPanel.open);
       if (validBox(s.twitchChatPanel)) state.box = clampBox(s.twitchChatPanel, window.innerWidth, window.innerHeight);
@@ -394,16 +520,30 @@ if (window.top === window) { // not inside Kick's own frames
     render();
   });
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local" || (!changes.showTwitchChat && !changes.kickIndex)) return;
+    if (area !== "local" || (!changes.showTwitchChat && !changes.kickIndex && !changes.twitchChatStyle)) return;
     if (changes.showTwitchChat) state.enabled = Boolean(changes.showTwitchChat.newValue);
     if (changes.kickIndex) state.index = changes.kickIndex.newValue || {};
+    if (changes.twitchChatStyle) {
+      const next = validStyle(changes.twitchChatStyle.newValue);
+      if (next !== state.style) { state.style = next; refreshFrame(); } // changed in Settings: reload the chat in the new style
+    }
     render(); // the tab appears or disappears straight away
   });
 
-  // Kick is a single-page app: watch for navigation to another channel.
-  const schedule = () => { clearTimeout(renderTimer); renderTimer = setTimeout(render, 300); };
+  // Kick is a single-page app. Check the page on a STEADY beat: at most once per 300 ms however busy the page is. (Waiting for a quiet
+  // moment instead never happens on a busy chat, and the panel would not appear until a refresh.)
+  const schedule = () => {
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => { renderTimer = null; render(); }, 300);
+  };
   new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
   window.addEventListener("popstate", schedule);
+  // Moving between streamers changes the address without any event a content script can hear, so watch the address itself.
+  let lastPath = location.pathname;
+  setInterval(() => {
+    if (location.pathname !== lastPath) { lastPath = location.pathname; schedule(); }
+    else if (mode === "floating") schedule(); // keep looking for Kick's chat while the fallback is showing
+  }, 400);
   window.addEventListener("resize", () => {
     if (mode === "docked") track();
     else if (view && state.box) { state.box = clampBox(state.box, window.innerWidth, window.innerHeight); if (state.open) applyBox(); }

@@ -55,6 +55,7 @@
   <small>Credentials are stored locally in this browser profile (dev/testing use).</small>
 
   <div class="tabs" role="tablist" aria-label="Settings sections">
+    <button class="tab" role="tab" id="tab-about" data-tab="about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About / Info</button>
     <button class="tab" role="tab" id="tab-general" data-tab="general" aria-controls="panel-general" aria-selected="true" tabindex="0">General</button>
     <button class="tab" role="tab" id="tab-connections" data-tab="connections" aria-controls="panel-connections" aria-selected="false" tabindex="-1">Connections</button>
     <button class="tab" role="tab" id="tab-keys" data-tab="keys" aria-controls="panel-keys" aria-selected="false" tabindex="-1">API keys</button>
@@ -62,7 +63,6 @@
     <button class="tab" role="tab" id="tab-matches" data-tab="matches" aria-controls="panel-matches" aria-selected="false" tabindex="-1">Matches</button>
     <button class="tab" role="tab" id="tab-backup" data-tab="backup" aria-controls="panel-backup" aria-selected="false" tabindex="-1">Backup</button>
     <button class="tab" role="tab" id="tab-diagnostics" data-tab="diagnostics" aria-controls="panel-diagnostics" aria-selected="false" tabindex="-1">Diagnostics</button>
-    <button class="tab" role="tab" id="tab-about" data-tab="about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About / Info</button>
   </div>
 
   <section role="tabpanel" id="panel-general" aria-labelledby="tab-general">
@@ -88,7 +88,19 @@
     Pick Twitch to chat there instead, in the same place, so you can talk in both. It signs in with your existing Twitch login
     (no second sign-in) once you allow chat permission. Nothing connects to Twitch until you open the Twitch tab. Possible
     impersonators never get one.</small>
-  <p><small id="chatPermNote"></small> <button id="chatPermAllow" class="secondary" type="button" hidden>Allow Twitch chat</button></p>
+  <p><small id="chatPermNote"></small> <button id="chatPermAllow" class="secondary" type="button" hidden>Allow Twitch chat</button>
+    <small>(Only the basic chat uses this permission.)</small></p>
+
+  <label for="twitchChatStyle">Twitch chat style</label>
+  <select id="twitchChatStyle">
+    <option value="builtin">Basic: built into the extension (signs in with your extension login)</option>
+    <option value="official">Full: Twitch's own chat (all of Twitch's features)</option>
+  </select>
+  <small><b>Basic</b> is a simpler chat made by this extension. It uses the Twitch login you already gave it, but it has no emote
+    picker, bits, polls or predictions. <b>Full</b> is Twitch's own chat: Twitch's real chat page, with everything it has. It signs in with
+    your twitch.tv login in this browser (not this extension's), so you need to be logged in to twitch.tv here, and Chrome has to allow
+    Twitch's cookies inside Kick pages. If it asks you to log in and can't, use <b>Pop out</b>: Twitch's chat opens in its own window,
+    where login always works. You can also switch with the button at the top of the chat.</small>
 
   <h2>Automatic refresh</h2>
   <small>How often the extension refreshes by itself while Chrome is running. The two are independent. The ↻ button in the
@@ -176,7 +188,7 @@
 
   <h2>Test a lookup</h2>
   <div class="row">
-    <input id="testLogin" placeholder="Twitch username, e.g. xqc">
+    <input id="testLogin" placeholder="Twitch username, e.g. summit1g">
     <button id="test">Test</button>
   </div>
   <pre id="out">—</pre>
@@ -353,10 +365,12 @@
       usual. <b>Twitch</b> puts that streamer's Twitch chat in the same place, so you can follow and talk in both. Switching back to
       Kick keeps the Twitch chat connected underneath.</p>
     <ul>
-      <li><b>One login:</b> the Twitch chat is a small chat client built into the extension and signed in with the Twitch login you
-        already gave it, so there is no second sign-in. Chatting needs an extra permission (read and send chat messages) that you
-        allow in Settings → Connections; until then it is read-only. Twitch's own chat embed can't share your login, which is why the
-        extension has its own.</li>
+      <li><b>Two styles:</b> <b>Basic</b> (the default) is a simpler chat made by this extension. It is signed in with the Twitch login
+        you already gave it, so there is no second sign-in. Chatting needs an extra permission (read and send chat messages) that you
+        allow in Settings → Connections; until then it is read-only. It has no emote picker, bits, polls or predictions.
+        <b>Full</b> is Twitch's own chat: Twitch's real chat page, with all of that. It signs in with your twitch.tv login in this browser,
+        not this extension's (nothing can hand it the extension's login), and Chrome has to allow Twitch's cookies inside Kick pages.
+        Choose in Settings → Display, or with the button at the top of the chat.</li>
       <li><b>Which channels:</b> only Kick channels matched to a streamer you follow on Twitch (the same matches as the popup). A
         possible impersonator, or a match you marked “not them”, gets no tab. A channel matched by name only shows a small
         “Same username, not verified” note.</li>
@@ -365,7 +379,14 @@
         change Kick's page.</li>
       <li><b>If it can't find Kick's chat</b> (Kick changed its layout), a floating “Twitch chat” panel is used instead: drag it by its
         title bar and resize it from the corner. Settings → Diagnostics shows which one is in use.</li>
-      <li><b>Pop out</b> opens the chat in its own window. It's also offered if Kick's page doesn't allow the frame.</li>
+      <li><b>If Kick's page blocks it:</b> some Kick pages send a security header (Cross-Origin-Embedder-Policy) that makes Chrome refuse to show any outside
+        page in a frame unless that page opts in. Twitch's chat doesn't, so Chrome shows its own “blocked” page. Pop out isn't affected. Only when
+        Kick sends that header, and only for Twitch's chat frame on Kick pages, the extension adds the two opt-in headers to Twitch's response (Chrome's
+        declarativeNetRequest permission). It changes nothing else, and removes the change if you turn Show Twitch Chat off.</li>
+      <li><b>If Full chat is blank:</b> the extension is allowed to <i>watch</i> (never change) how Twitch answers that one chat frame, using
+        Chrome's webRequest permission on www.twitch.tv/embed pages only. If Twitch, an ad or privacy blocker, or the browser stops the frame,
+        the panel says so, with Pop out and Basic chat. Settings → Diagnostics shows what Twitch and Kick answered, and a “Not loading? See why” link under Full chat opens it.</li>
+      <li><b>Pop out</b> opens the chat in its own window (in Twitch's own style, Twitch's pop-out chat, where login always works). It's also offered if Kick's page doesn't allow the frame.</li>
       <li><b>What it shows:</b> messages with names, colours, emotes and badges, and your own messages as you send them (including
         /me). Other chat commands, and third-party emotes, aren't supported. Twitch's own rules still apply, such as slow mode.</li>
     </ul>
@@ -390,8 +411,10 @@
         the Twitch tab.</li>
       <li><b>Kick:</b> api.kick.com and id.kick.com, kick.com for profile details, and files.kick.com for pictures.</li>
     </ul>
-    <p>With Show Twitch Chat on, Twitch chat is shown on Kick channel pages by the extension's own chat client, only after you open the
-      Twitch tab. The extension saves which tab you last used, and where you left the floating panel (position, size, open or closed),
+    <p>With Show Twitch Chat on, Twitch chat is shown on Kick channel pages by the extension's own chat client, or, if you choose Twitch's own
+      chat, Twitch's chat page is loaded from www.twitch.tv in a frame (Twitch sees an embed on kick.com and uses your twitch.tv login if you
+      have one). Either way only after you open the Twitch tab. For Full chat it also records, on this computer, how Twitch answered the
+      last chat frame (the status and whether it allowed kick.com), to explain a blank chat. The extension saves which tab you last used, and where you left the floating panel (position, size, open or closed),
       on this computer.</p>
     <p>The Twitch login only asks to read who you follow, plus, only if you allow it, to read and send chat messages. The Kick login only
       asks to read your profile and isn't used for
